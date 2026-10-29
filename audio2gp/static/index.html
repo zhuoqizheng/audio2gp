@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>audio2gp — 本地音频转 Guitar Pro 草稿</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6b4f'/%3E%3Cpath d='M18 44V20l22-5v22' fill='none' stroke='%23fff' stroke-width='5' stroke-linecap='round'/%3E%3Ccircle cx='15' cy='45' r='8' fill='%23fff'/%3E%3Ccircle cx='38' cy='40' r='8' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div>
+      <p class="eyebrow">LOCAL · OFFLINE · RTX 4090</p>
+      <h1>audio2gp</h1>
+      <p class="lede">把一首完整混音拆成鼓、贝斯、人声和其他声部，自动记谱、分析和弦，并导出可继续编辑的多轨 <strong>.gp5</strong>；也可以只导出 MIDI。</p>
+    </div>
+    <div class="badge-stack" aria-label="运行方式">
+      <span class="badge">仅监听 127.0.0.1</span>
+      <span class="badge">音频不上传云端</span>
+      <span class="badge">无 LLM 记谱</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card" id="uploadPanel">
+      <div class="card-head">
+        <div>
+          <p class="step">STEP 1</p>
+          <h2>上传与参数</h2>
+        </div>
+        <p class="card-note">支持 MP3、WAV、FLAC、M4A、OGG 等。<span id="limitsNote">默认上限 200 MB / 10 分钟，可在启动参数中调整。</span></p>
+      </div>
+
+      <form id="jobForm" novalidate>
+        <div class="upload-row">
+          <label class="file-drop" for="fileInput">
+            <input id="fileInput" name="file" type="file" accept="audio/*,.wav,.mp3,.flac,.m4a,.aac,.ogg,.oga,.aif,.aiff" required>
+            <span class="file-title">选择完整混音文件</span>
+            <span class="file-hint" id="fileHint">点击选择，或把文件拖到这里。请使用包含全部乐器的成品混音，而不是单独乐器轨。</span>
+          </label>
+          <div class="upload-aside">
+            <p><strong>为什么需要完整混音？</strong> Demucs 会先从混音中分离四类声部，再分别转谱。若你已经有干净的单独轨，也可以把该轨当作混音上传，并在“参与转谱的声部”中只勾选对应声部。</p>
+            <p><strong>隐私：</strong>所有模型推理、量化、GP5 生成均在本机完成；浏览器只访问 localhost。</p>
+          </div>
+        </div>
+
+        <div class="option-grid">
+          <label class="field">
+            <span class="label">Demucs 模型 <button type="button" class="info" aria-label="说明" data-tip="htdemucs_ft 是四模型集成，分轨更干净但速度约慢四倍；htdemucs 更快，适合先试听与迭代。">i</button></span>
+            <select id="modelSelect">
+              <option value="htdemucs_ft" selected>htdemucs_ft — 高质量（推荐）</option>
+              <option value="htdemucs">htdemucs — 更快</option>
+            </select>
+            <small>首次使用会下载约 321 MB 权重并缓存到本机。高质量模型对吉他、人声的串音更少。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">输出格式 <button type="button" class="info" aria-label="说明" data-tip="GP5 + MIDI 模式会做指法搜索、生成多轨 song.gp5、tracks.json，并启用在线改谱；仅 MIDI 模式跳过指法、GP5 与在线编辑器，仍生成分轨 MIDI、full.mid、和弦、元数据和 ZIP。">i</button></span>
+            <select id="exportFormatSelect">
+              <option value="gp5_midi" selected>多轨 GP5 + MIDI（可在线改谱）</option>
+              <option value="midi_only">仅 MIDI（不生成 GP5）</option>
+            </select>
+            <small id="outputFormatHint">GP5 模式需要所选声部能产生至少一条弦乐/鼓/人声轨。仅 MIDI 模式更快，也适合只想要成品 MIDI 的用户；不会生成 song.gp5 或 tracks.json。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">拍号 <button type="button" class="info" aria-label="说明" data-tip="本工具不做自动拍号识别，由你指定。BPM 一律按四分音符计算，因此 6/8、12/8 的一小节分别是 2、4 个附点四分音符拍。Shuffle 不是拍号：通常是 4/4 的摇摆八分，可记成 12/8，或用 4/4 + 1/8 三连音量化。">i</button></span>
+            <select id="timeSignatureSelect">
+              <option value="4/4" selected>4/4 — 最常用（每小节 4 个四分音符）</option>
+              <option value="3/4">3/4 — 三拍子 / 华尔兹</option>
+              <option value="2/4">2/4 — 进行曲 / 二拍子</option>
+              <option value="6/8">6/8 — 复合二拍（每小节 2 个附点四分）</option>
+              <option value="9/8">9/8 — 复合三拍（每小节 3 个附点四分）</option>
+              <option value="12/8">12/8 — 慢布鲁斯 / shuffle（每小节 4 个附点四分）</option>
+            </select>
+            <small>拍号决定小节长度、GP5/MIDI 的拍号标记和小节线位置。选择 12/8 适合三连音感的 shuffle 与慢布鲁斯；普通 4/4 的 shuffle 也可以选 4/4，并把量化网格设为“1/8 三连音”。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">量化网格 <button type="button" class="info" aria-label="说明" data-tip="量化把音符起止吸附到音符时值网格，与拍号无关：1/8 对应八分音符（480 tick），1/8 三连音对应每拍三等分（320 tick）。">i</button></span>
+            <select id="quantizeSelect">
+              <option value="8">1/8 — 八分音符网格</option>
+              <option value="12">1/8 三连音 — 摇摆/shuffle 的八分</option>
+              <option value="16" selected>1/16 — 十六分音符网格（推荐）</option>
+              <option value="32">1/32 — 三十二分音符网格（最细）</option>
+            </select>
+            <small>网格越细越能保留快速乐句，但误检和“碎音”也越多。网格表示音符时值，不随拍号改变；三连音网格与普通 1/8、1/16 不会混用。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">吉他来源 <button type="button" class="info" aria-label="说明" data-tip="通常用 Demucs 的 other 声部。若这是一首只有人声与吉他的歌，也可以把主唱旋律映射成吉他单音线。">i</button></span>
+            <select id="guitarStemSelect">
+              <option value="other" selected>other 声部（吉他/键盘等）</option>
+              <option value="vocals">vocals 声部（主旋律）</option>
+            </select>
+            <small>Guitar 轨将使用该声部的音高与节奏做指法搜索。选择 vocals 时不会再额外生成 Vocals 轨。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">吉他调弦 <button type="button" class="info" aria-label="说明" data-tip="标准 EADGBE、Drop D（第六弦 D2）或整体降半音。弦号 1 永远表示最细的高音弦。">i</button></span>
+            <select id="guitarTuningSelect">
+              <option value="standard" selected>标准 EADGBE</option>
+              <option value="drop_d">Drop D (DADGBE)</option>
+              <option value="half_step_down">降半音 (Eb Ab Db Gb Bb Eb)</option>
+            </select>
+            <small>指法搜索会优先把音符放在所选调弦的可弹位置；1 弦为最细弦。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">贝斯调弦 <button type="button" class="info" aria-label="说明" data-tip="四弦贝斯的标准 EADG 或 Drop D（DADG）。">i</button></span>
+            <select id="bassTuningSelect">
+              <option value="standard" selected>标准 4 弦 EADG</option>
+              <option value="drop_d">Drop D (DADG)</option>
+            </select>
+            <small>贝斯轨强制单音；同一时刻只保留音高最低的候选，避免分离串音造成和弦。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">最大品位 <button type="button" class="info" aria-label="说明" data-tip="限制指法搜索的品位范围。太小会导致高音被八度折叠或省略；15 品是较稳妥的默认值。">i</button></span>
+            <input id="maxFret" type="number" min="0" max="24" step="1" value="15">
+            <small>超过该品位的音会尝试八度折叠，仍无法放置时会被省略并在结果中提示。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">速度覆盖（BPM） <button type="button" class="info" aria-label="说明" data-tip="填 0 表示自动。自动流程先用整曲节拍，再用鼓声部在 70–180 BPM 内验证，处理半速/倍速歧义。">i</button></span>
+            <input id="bpmOverride" type="number" min="0" max="300" step="0.1" value="0">
+            <small>0 = 自动。若自动速度出现半速/倍速错误，可在这里填入正确速度；这会关闭鼓点修正。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">推理设备 <button type="button" class="info" aria-label="说明" data-tip="auto 会优先使用可用 CUDA；显存不足时 Demucs 分离会自动回退 CPU 并给出警告。">i</button></span>
+            <select id="deviceSelect">
+              <option value="auto" selected>auto — 优先 CUDA</option>
+              <option value="cuda">强制 CUDA</option>
+              <option value="cpu">CPU（很慢）</option>
+            </select>
+            <small>RTX 4090 建议 auto/cuda。Basic Pitch 0.4 在本环境使用 TFLite CPU 推理，因此转录阶段仍会占用 CPU。</small>
+          </label>
+        </div>
+
+        <fieldset class="stems-box">
+          <legend>参与转谱的声部 <button type="button" class="info" aria-label="说明" data-tip="Demucs 始终分离四轨，但只有勾选的声部会转谱、生成 MIDI/GP5 轨并进入结果。">i</button></legend>
+          <p class="hint">例如原曲只有吉他和人声，可只勾选 “other” 与 “vocals”，得到两轨谱。GP5 模式至少需要一个能产生轨道的声部；仅 MIDI 模式只需至少选择一个声部。和弦分析只使用勾选的 other / bass / vocals 和声声部。</p>
+          <div class="checks">
+            <label class="check"><input id="stemOther" type="checkbox" checked> <span><strong>other</strong><small>吉他、键盘与其他和声乐器；默认作为 Guitar 轨来源。</small></span></label>
+            <label class="check"><input id="stemBass" type="checkbox" checked> <span><strong>bass</strong><small>贝斯声部；生成单音 Bass 轨。</small></span></label>
+            <label class="check"><input id="stemDrums" type="checkbox" checked> <span><strong>drums</strong><small>鼓声部；用起音与频段规则识别底鼓、军鼓、镲片与桶鼓。</small></span></label>
+            <label class="check"><input id="stemVocals" type="checkbox" checked> <span><strong>vocals</strong><small>人声；可生成额外旋律轨，或作为 Guitar 轨来源。</small></span></label>
+          </div>
+        </fieldset>
+
+        <details class="advanced">
+          <summary>高级参数与行为说明</summary>
+          <div class="option-grid">
+            <label class="field">
+              <span class="label">自动建议调弦</span>
+              <label class="switch-row"><input id="suggestTuning" type="checkbox"> <span>尝试所有预设调弦并选择覆盖音符最多的一种</span></label>
+              <small>关闭时严格使用你选择的调弦。开启后若建议不同，会在警告中说明；覆盖优先、低把位次之。</small>
+            </label>
+            <label class="field">
+              <span class="label">BPM 优先取自鼓轨</span>
+              <label class="switch-row"><input id="tempoFromDrums" type="checkbox" checked> <span>用分离后的鼓点校正整曲速度</span></label>
+              <small>鼓轨清晰时更稳。若鼓与整曲网格差异小于 4% 会保留小节网格版本，避免无意义漂移；差异大时会警告并采用鼓速。</small>
+            </label>
+            <label class="field">
+              <span class="label">检测调性</span>
+              <label class="switch-row"><input id="detectKey" type="checkbox" checked> <span>估计大小调并写入 GP5 调号</span></label>
+              <small>用 Krumhansl–Kessler 调性模板叠加和声声部；失败不影响主流程，GP5 保持 C 大调。</small>
+            </label>
+            <label class="field">
+              <span class="label">分析和弦</span>
+              <label class="switch-row"><input id="detectChords" type="checkbox" checked> <span>从和声声部估计每拍的和弦</span></label>
+              <small>使用 other / bass / vocals 生成合力和弦色度，按四分音符拍同步分析并做平滑；小节/拍标签按所选拍号显示（6/8、9/8、12/8 的“拍”是附点四分 pulse）。结果写入 chords.json、full.mid 的和弦标记，并在 GP5 第一条旋律轨标注和弦名。属于草稿级分析，不识别转位、斜线和复杂延伸音；关闭后不生成任何和弦结果。</small>
+            </label>
+            <label class="field">
+              <span class="label">对齐强拍</span>
+              <label class="switch-row"><input id="alignDownbeats" type="checkbox" checked> <span>按检测到的强拍放置小节线</span></label>
+              <small>自动修复节拍网格，并把第一个强拍作为小节起点；开头不足一小节的内容会放入前置小节。自动强拍分析目前只支持 4/4；其他拍号请填写下方“手动强拍位置”，否则第 1 小节从音频开头开始。</small>
+            </label>
+            <label class="field">
+              <span class="label">手动强拍位置（秒） <button type="button" class="info" aria-label="说明" data-tip="填写音频中第一个强拍（小节第 1 拍）出现的时间。填写后不再运行自动强拍分析，适用于任何拍号；开头是弱起时，前面的内容会自动放入前置小节。">i</button></span>
+              <input id="manualDownbeat" type="number" min="0" max="3600" step="0.01" value="0">
+              <small>0 = 不手动指定。若你知道第一个强拍的时间（例如 0.85 秒），填这里可以绕过自动检测；该值优先于“对齐强拍”的自动结果，并适用于所有拍号。弱起/前奏会保留在前置小节中。</small>
+            </label>
+            <label class="field">
+              <span class="label">推算连击/滑音</span>
+              <label class="switch-row"><input id="detectTechniques" type="checkbox" checked> <span>保守标记 hammer-on、pull-off 和出滑音</span></label>
+              <small>只在同弦、间隔 1–4 半音、间距 0–60 ms 且后音不更强时标记连击；滑音要求音高轨迹净移动至少 0.7 半音。</small>
+            </label>
+            <label class="field">
+              <span class="label">额外生成 Vocals 旋律轨</span>
+              <label class="switch-row"><input id="includeVocals" type="checkbox" checked> <span>人声不是 Guitar 来源时，单独生成一轨</span></label>
+              <small>人声轨用标准记谱显示；它不是实际吉他弦位。取消后仍可用人声作 Guitar 来源。</small>
+            </label>
+            <label class="field">
+              <span class="label">复制分轨到输出目录</span>
+              <label class="switch-row"><input id="keepStems" type="checkbox" checked> <span>保留 WAV 分轨供试听与下载</span></label>
+              <small>会占用更多磁盘。关闭后分轨仍在临时工作目录中可试听，但不会进入 ZIP。</small>
+            </label>
+            <label class="field">
+              <span class="label">复用分轨缓存</span>
+              <label class="switch-row"><input id="cacheStems" type="checkbox" checked> <span>允许 Demucs 分轨缓存</span></label>
+              <small>同一任务重跑时减少重复分离；缓存不会上传到任何地方。</small>
+            </label>
+            <label class="field">
+              <span class="label">Basic Pitch 起音阈值 <button type="button" class="info" aria-label="说明" data-tip="越高越保守，漏检增多；越低越容易把噪声当成音符。">i</button></span>
+              <input id="onsetThreshold" type="number" min="0" max="1" step="0.01" value="0.5">
+              <small>默认 0.5。复杂混音或 AI 生成伴奏若有大量碎音，可小幅提高。</small>
+            </label>
+            <label class="field">
+              <span class="label">Basic Pitch 帧阈值</span>
+              <input id="frameThreshold" type="number" min="0" max="1" step="0.01" value="0.3">
+              <small>默认 0.3。决定一个音高在持续帧中被保留的置信度门槛。</small>
+            </label>
+            <label class="field">
+              <span class="label">鬼音抑制强度</span>
+              <input id="ghostAmplitude" type="number" min="0" max="1" step="0.01" value="0.15">
+              <small>0 = 关闭。短于 0.15 秒且振幅低于峰值该比例的音会被移除，用于压制分离残留与八度假象。</small>
+            </label>
+            <label class="field">
+              <span class="label">最大同时发声数</span>
+              <input id="maxPolyphony" type="number" min="1" max="12" step="1" value="6">
+              <small>吉他默认 6（六根弦），贝斯固定单音，人声固定单音。过密的和弦会保留最强的若干音。</small>
+            </label>
+            <label class="field">
+              <span class="label">最短音符（秒）</span>
+              <input id="minNoteSec" type="number" min="0" max="1" step="0.01" value="0.03">
+              <small>短于该时长的旋律音会被丢弃；鼓点不受此限制。默认 30 ms。</small>
+            </label>
+            <label class="field">
+              <span class="label">GP5 时值布局</span>
+              <select id="layoutSelect">
+                <option value="auto" selected>auto — 优先延音，失败回退</option>
+                <option value="ties">ties — 尽量保留真实时值</option>
+                <option value="onset">onset — 每个起音重新拨弦</option>
+              </select>
+              <small>一般保持 auto。若谱面出现异常，可强制 onset 排查；编辑和重新导出沿用此设置。</small>
+            </label>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button id="startBtn" type="submit" class="primary">开始分析并生成 GP5</button>
+          <p id="formStatus" class="form-status" role="status"></p>
+        </div>
+      </form>
+    </section>
+
+    <section class="card" id="jobPanel" hidden>
+      <div class="card-head">
+        <div>
+          <p class="step">STEP 2</p>
+          <h2>处理进度</h2>
+        </div>
+        <p class="card-note">任务在本机串行执行；首次运行需要加载 Demucs 权重。关闭页面不会中断已开始的本地任务。</p>
+      </div>
+      <div class="progress-head">
+        <span id="stageLabel">排队中</span>
+        <span id="progressPct">0%</span>
+      </div>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressBar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <p id="jobMessage" class="job-message">准备上传…</p>
+      <div class="log-wrap">
+        <div class="log-head"><span>处理日志</span><span id="jobIdLabel"></span></div>
+        <pre id="logBox" class="log-box"></pre>
+      </div>
+    </section>
+
+    <section class="card" id="resultPanel" hidden>
+      <div class="card-head">
+        <div>
+          <p class="step">STEP 3</p>
+          <h2 id="resultTitle">预览与轻量改谱</h2>
+        </div>
+        <p id="resultCardNote" class="card-note">alphaTab 负责在线显示与播放；浏览器不能写 GP5。每次修改都先写入 <code>tracks.json</code>，再由服务器的 PyGuitarPro 导出链路重新生成 <code>song.gp5</code>。</p>
+      </div>
+
+      <div id="summary" class="summary-grid"></div>
+
+      <section id="chordPanel" class="chord-panel" hidden>
+        <div class="chord-head">
+          <div>
+            <h3>和弦进行（自动分析）</h3>
+            <p class="hint">按量化后的小节/拍显示，与 MIDI 标记和 GP5 和弦符号使用同一套标签。置信度表示该拍最可能的和弦与第二候选的差距，不是人工校验结果；低置信度段落请结合试听判断。</p>
+          </div>
+          <span id="chordMeta" class="chord-meta"></span>
+        </div>
+        <p id="chordProgression" class="chord-progression"></p>
+        <div id="chordTimeline" class="chord-timeline"></div>
+      </section>
+
+      <div id="noScoreNote" class="no-score-note" hidden>
+        <strong id="noScoreTitle">本次没有可预览的 GP5。</strong>
+        <p id="noScoreText">仍可在下方下载分轨 MIDI、full.mid、和弦结果和 ZIP。</p>
+      </div>
+
+      <div id="scoreWorkspace">
+        <div class="score-toolbar">
+        <button id="playBtn" type="button" class="secondary" disabled>▶ 播放</button>
+        <span id="playPos" class="play-pos">尚未加载乐谱</span>
+        <span class="toolbar-hint">点击谱面中的音符查看可替换的弦/品；使用下方静音按钮试听各声部。</span>
+      </div>
+
+      <div class="editor-grid">
+        <div>
+          <div id="scoreView" class="score-view" aria-label="alphaTab 乐谱预览"></div>
+          <p id="scoreHint" class="score-hint">正在准备预览…</p>
+        </div>
+        <aside id="noteEditor" class="note-editor" hidden>
+          <div class="note-head">
+            <div>
+              <p class="step">NOTE</p>
+              <h3 id="noteTitle">未选择音符</h3>
+            </div>
+            <button id="closeNoteBtn" type="button" class="icon-btn" title="关闭">✕</button>
+          </div>
+          <p class="hint">点选一个音高相同的可弹位置会保持音高不变。手动修改品位会按新位置改变实际音高。</p>
+          <div id="noteAlts" class="alternatives"></div>
+          <div class="manual-position">
+            <label>弦 <select id="manualString"></select></label>
+            <label>品 <input id="manualFret" type="number" min="0" max="24" step="1"></label>
+            <button id="applyPositionBtn" type="button" class="secondary">应用弦/品</button>
+          </div>
+          <button id="deleteNoteBtn" type="button" class="danger">删除这个音符</button>
+          <p id="noteStatus" class="form-status" role="status"></p>
+        </aside>
+      </div>
+
+        <div class="mixer">
+          <div class="mixer-head">
+            <h3>轨道与静音</h3>
+            <p class="hint">静音会写入编辑状态并立即用于预览，同时重新导出 GP5/MIDI；导出文件仍保留该轨，取消静音即可恢复。</p>
+          </div>
+          <div id="trackMixer" class="mixer-list"></div>
+        </div>
+      </div>
+
+      <div class="downloads">
+        <h3>下载</h3>
+        <div id="downloadLinks" class="download-links"></div>
+        <p class="hint">GP5 是草稿而非成品谱：拍号由你指定（不做自动识别）、近似鼓记谱、启发式指法与自动和弦；建议在 Guitar Pro 或 TuxGuitar 中继续调整。仅 MIDI 模式不会提供 GP5 或在线改谱。</p>
+      </div>
+
+      <div id="stemPlayers" class="stem-players"></div>
+
+      <details id="warningsPanel" class="warnings" hidden>
+        <summary>处理警告 <span id="warningCount"></span></summary>
+        <ul id="warningList"></ul>
+      </details>
+    </section>
+
+    <section class="card muted" id="aboutPanel">
+      <h2>这个工具做了什么，没做什么</h2>
+      <div class="about-grid">
+        <div>
+          <h3>流程</h3>
+          <p>Demucs 分离 → 节拍/强拍与鼓速校正 → Basic Pitch 旋律转录 + 鼓点频段分类 → 量化与鬼音清理 → 和弦分析 → 手型 Viterbi 指法（GP5 模式）→ 多轨 GP5 或仅 MIDI。所有步骤都在本机完成。</p>
+        </div>
+        <div>
+          <h3>边界</h3>
+          <p>不接入 LLM，不做云端推理，不抓取商业谱库。在线编辑器只支持改弦/品、删除音符和静音；不是完整的 Guitar Pro 替代品。</p>
+        </div>
+        <div>
+          <h3>结果状态</h3>
+          <p>GP5 生成失败时仍会交付 MIDI、和弦与 ZIP，任务标记为“部分成功”。仅 MIDI 模式属于正常完成，不生成 GP5 或在线编辑状态；MIDI 可导入其他制谱软件继续修正。</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="/static/vendor/alphatab/alphaTab.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

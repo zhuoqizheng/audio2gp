@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "audio2gp"
+version = "0.2.0"
+description = "Local audio-to-stems/MIDI/Guitar Pro draft pipeline with a browser score editor"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# Runtime packages are pinned in requirements.txt and installed by
+# scripts/setup_env.sh. They are intentionally not duplicated here so
+# `pip install -e . --no-deps` cannot disturb the CUDA torch environment.
+dependencies = []
+
+[project.scripts]
+audio2gp = "audio2gp.cli:main"
+audio2gp-web = "audio2gp.api:main"
+audio2gp-gradio = "audio2gp.web_app:main"
+
+[tool.setuptools]
+packages = ["audio2gp"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+audio2gp = [
+  "static/*.html",
+  "static/*.css",
+  "static/*.js",
+  "static/vendor/alphatab/*.js",
+  "static/vendor/alphatab/*.sf2",
+  "static/vendor/alphatab/*.txt",
+  "static/vendor/alphatab/*.md",
+  "static/vendor/alphatab/*.LICENSE",
+  "static/vendor/alphatab/font/*",
+]
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: slow end-to-end tests that load real models",
+]
+# ROS 2's globally installed launch_testing pytest plugins autoload into the
+# venv (the user site is on sys.path for CUDA torch) but their dependencies
+# are not installed. Block them before pytest imports their entry points.
+addopts = "-ra -m 'not slow' -p no:launch_testing -p no:launch_ros -p no:ament_flake8 -p no:ament_lint -p no:ament_pep257 -p no:ament_copyright -p no:ament_xmllint"

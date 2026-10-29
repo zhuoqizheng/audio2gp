@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.eggs/
+*.egg-info/
+build/
+dist/
+output/
+work/
+.DS_Store
+*.log
+
+# Local test media and generated scores (never commit copyrighted audio)
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.ogg
+*.gp5

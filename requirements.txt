@@ -1,0 +1,37 @@
+# Top-level, non-torch dependencies for audio2gp.
+#
+# torch and torchaudio are intentionally NOT installed here: this project
+# reuses the CUDA torch already present in the user site. See
+# scripts/setup_env.sh for the deliberate .pth ordering that makes that work.
+#
+# Demucs is also installed separately (with --no-deps) by setup_env.sh so pip
+# cannot pull a second, CPU-only torch. Do not add demucs to this file unless
+# you also change the setup procedure.
+basic-pitch==0.4.0
+tflite-runtime==2.14.0; sys_platform == "linux" and python_version < "3.11"
+numpy==1.26.4
+scipy==1.11.4
+librosa==0.11.0
+scikit-learn==1.7.2
+resampy==0.4.2
+pretty_midi==0.2.11
+mido>=1.3,<2
+# Pure-Python modern port of madmom's inference code. It downloads a small
+# BLSTM downbeat ensemble (~3.2 MB) to the user cache on first use. The package
+# code is BSD-2-Clause, but the model weights are CC BY-NC-SA 4.0
+# (non-commercial, share-alike); see README.md before commercial use.
+madmom-infer==0.2.0
+PyGuitarPro==0.11
+# FastAPI + static HTML is the primary UI. Gradio remains available as the
+# legacy `audio2gp-gradio` entry point.
+fastapi==0.162.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+gradio==6.31.0
+soundfile>=0.12.1,<0.14
+# resampy (used by Basic Pitch/librosa) still imports pkg_resources, which was
+# removed from setuptools 81. Pin the last compatible 80.x release.
+setuptools==80.10.2
+pytest>=8,<9
+# TestClient / browser-facing API tests.
+httpx==0.28.1

@@ -1,0 +1,7 @@
+# Shared constraints for every pip invocation in setup_env.sh.
+# These keep Demucs/Basic Pitch/Gradio on the tested numpy 1.x stack.
+numpy==1.26.4
+scipy==1.11.4
+librosa==0.11.0
+scikit-learn==1.7.2
+resampy==0.4.2
