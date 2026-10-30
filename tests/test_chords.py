@@ -39,6 +39,21 @@ def _synth(prog: list[tuple[int, str]], *, lead_s: float = 0.0) -> np.ndarray:
     return audio.astype(np.float32)
 
 
+def _bass(prog: list[tuple[int, str]]) -> np.ndarray:
+    """One sine note per bar, an octave below each chord root."""
+    beat_s = 60.0 / BPM
+    total = len(prog) * 4 * beat_s
+    audio = np.zeros(int(total * SR), dtype=float)
+    times = np.arange(audio.size) / SR
+    for index, (root, _quality) in enumerate(prog):
+        frequency = 440.0 * 2 ** ((36 + root - 69) / 12)
+        start = index * 4 * beat_s
+        mask = (times >= start) & (times < start + 4 * beat_s)
+        pulse = 0.5 + 0.5 * np.exp(-4.0 * ((times[mask] - start) % beat_s))
+        audio[mask] += 0.4 * np.sin(2 * np.pi * frequency * times[mask]) * pulse
+    return audio.astype(np.float32)
+
+
 def _write(path: Path, audio: np.ndarray) -> Path:
     wavfile.write(path, SR, audio)
     return path
@@ -88,6 +103,22 @@ def test_major_minor_progression_segments_and_summary(tmp_path: Path) -> None:
         "progression": ["C", "G", "Am", "F"],
     }
     assert chords_from_state(doc["segments"])[1].label == "G"
+
+
+def test_bass_leakage_does_not_invent_sevenths(tmp_path: Path) -> None:
+    # C, G, Am, F with a sine bass.  A coarse CQT leaks the bass root into the
+    # adjacent semitones and reports Cmaj7/Gmaj7/Fmaj7; 36 bins per octave must
+    # keep the plain triads.
+    prog = [(0, "major"), (7, "major"), (9, "minor"), (5, "major")]
+    other = _write(tmp_path / "other.wav", _synth(prog))
+    bass = _write(tmp_path / "bass.wav", _bass(prog))
+    events = analyze_chords(
+        {"other": other, "bass": bass},
+        BPM,
+        offset_s=0.0,
+        duration_s=8.0,
+    )
+    assert [event.label for event in events] == ["C", "G", "Am", "F"]
 
 
 def test_offset_places_the_first_chord_at_tick_zero(tmp_path: Path) -> None:

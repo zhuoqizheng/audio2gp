@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,22 @@ from audio2gp import rhythm
 from audio2gp.config import Options
 from audio2gp.midi_post import clean
 from audio2gp.types import NoteEvent
+
+
+def test_fold_bpm_rejects_zero_without_hanging() -> None:
+    result: dict[str, BaseException] = {}
+
+    def call() -> None:
+        try:
+            rhythm._fold_bpm(0.0)
+        except BaseException as exc:  # noqa: BLE001 - captured for the assertion
+            result["error"] = exc
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    thread.join(1.0)
+    assert not thread.is_alive(), "_fold_bpm(0.0) did not terminate"
+    assert isinstance(result.get("error"), ValueError)
 
 
 def test_choose_grid_offset_without_pickup() -> None:
@@ -80,6 +97,35 @@ def test_analyze_rhythm_falls_back_and_reports_the_reason(
     info = rhythm.analyze_rhythm(path)
     assert info.method == "librosa-accent"
     assert any("madmom-infer" in warning for warning in info.warnings)
+
+
+def test_non_4_4_meter_skips_madmom_and_passes_the_meter_to_librosa(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "song.wav"
+    path.write_bytes(b"fake")
+    seen: dict[str, str] = {}
+
+    def unexpected_madmom(*args, **kwargs):
+        raise AssertionError("madmom must not run for 6/8")
+
+    def fake_librosa(*args, **kwargs):
+        seen["meter"] = kwargs["meter"].label
+        return rhythm.RhythmInfo(
+            bpm=120.0,
+            beats_per_bar=3,
+            beat_times_s=[0.0, 0.5, 1.0, 1.5],
+            downbeat_times_s=[0.0, 1.5],
+            method="librosa-accent",
+        )
+
+    monkeypatch.setattr(rhythm, "_analyze_madmom", unexpected_madmom)
+    monkeypatch.setattr(rhythm, "_analyze_librosa", fake_librosa)
+    info = rhythm.analyze_rhythm(path, meter="6/8")
+    assert seen["meter"] == "6/8"
+    assert info.beats_per_bar == 3
+    assert info.downbeat_times_s == [0.0, 1.5]
+    assert info.warnings == []
 
 
 def test_clean_applies_a_positive_downbeat_offset() -> None:

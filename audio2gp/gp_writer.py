@@ -148,11 +148,15 @@ def _decompose(length: int) -> list[DurationSpec]:
     return list(result)
 
 
-def _largest_leq(length: int) -> DurationSpec:
+def _largest_fittable(length: int) -> DurationSpec:
+    """Largest single beat that leaves a rest GP can represent."""
     for spec in DURATION_SPECS:
-        if spec[0] <= length:
+        ticks = spec[0]
+        if ticks > length:
+            continue
+        if _decompose_cached(length - ticks) is not None:
             return spec
-    raise ValueError(f"GP tick length {length} is too short for a beat")
+    raise ValueError(f"GP tick length {length} cannot be split into a beat and a rest")
 
 
 def _duration(spec: DurationSpec) -> gp.Duration:
@@ -276,8 +280,10 @@ def _add_onset_layout(
             _add_rests(voice, onset - pos)
             pos = onset
         next_onset = onsets[index + 1] if index + 1 < len(onsets) else bar_end
-        interval = max(grid_t, next_onset - onset)
-        duration_ticks = _largest_leq(interval)[0]
+        # The largest note value can leave an unrepresentable rest (a 1320-tick
+        # gap: 1280 + 40). Pick a value whose remainder GP can write.
+        interval = min(max(grid_t, next_onset - onset), bar_end - onset)
+        duration_ticks = _largest_fittable(interval)[0]
         note_tuples = [
             _note_tuple(n, gp.NoteType.normal)
             for n in sorted(groups[onset], key=lambda n: n.string)
@@ -325,8 +331,9 @@ def _add_drum_layout(
             note_tuples.append(_drum_tuple(note, lane))
         if not note_tuples:
             continue
-        _add_sounding(voice, grid_t, note_tuples)
-        pos = onset + grid_t
+        length = _largest_fittable(min(grid_t, bar_end - onset))[0]
+        _add_sounding(voice, length, note_tuples)
+        pos = onset + length
     if pos < bar_end:
         _add_rests(voice, bar_end - pos)
 

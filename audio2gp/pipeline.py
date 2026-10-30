@@ -9,8 +9,10 @@ from typing import Callable
 
 from . import chords as chords_mod
 from . import drums as drums_mod
+from . import engines
 from . import fingering as fingering_mod
 from . import keydetect as keydetect_mod
+from . import midi_in
 from . import midi_post
 from . import preprocess as preprocess_mod
 from . import rhythm as rhythm_mod
@@ -29,7 +31,15 @@ from .config import (
     resolve_device,
 )
 from .gp_writer import write_gp5
-from .types import ChordEvent, FingeredNote, Note, NoteEvent, RunResult, TabTrack
+from .types import (
+    ChordEvent,
+    FingeredNote,
+    Note,
+    NoteEvent,
+    PreprocessedAudio,
+    RunResult,
+    TabTrack,
+)
 from .utils import (
     copy_file,
     ensure_dir,
@@ -120,7 +130,9 @@ def _guitar_track(
     source_notes = cleaned.get(source, [])
     scores: list[dict[str, float | str]] = []
     if source == "vocals":
-        notes, warnings = fingering_mod.arrange_vocals(source_notes)
+        notes, warnings = fingering_mod.arrange_vocals(
+            source_notes, max_fret=options.max_fret
+        )
         used_tuning = "standard"
     elif options.suggest_tuning:
         used_tuning, scores, notes, warnings = fingering_mod.suggest_tuning(
@@ -222,8 +234,10 @@ def _drum_track(cleaned: dict[str, list[Note]]) -> TabTrack:
     )
 
 
-def _vocals_track(cleaned: dict[str, list[Note]]) -> TabTrack:
-    notes, warnings = fingering_mod.arrange_vocals(cleaned.get("vocals", []))
+def _vocals_track(cleaned: dict[str, list[Note]], options: Options) -> TabTrack:
+    notes, warnings = fingering_mod.arrange_vocals(
+        cleaned.get("vocals", []), max_fret=options.max_fret
+    )
     return TabTrack(
         name="Vocals",
         stem="vocals",
@@ -257,7 +271,7 @@ def _build_tracks(
         and "vocals" in options.selected_stems
         and options.guitar_stem != "vocals"
     ):
-        tracks.append(_vocals_track(cleaned))
+        tracks.append(_vocals_track(cleaned, options))
     if not tracks:
         raise ValueError("the selected stems produce no GP5 track")
     return tracks, tunings
@@ -355,6 +369,8 @@ def run(
     timings: dict[str, float] = {}
     total_start = time.perf_counter()
     input_size = input_path.stat().st_size if input_path.exists() else 0
+    is_midi = input_path.suffix.lower() in midi_in.MIDI_EXTENSIONS
+    input_kind = "midi" if is_midi else "audio"
 
     def error_meta(stage: str, exc: BaseException) -> PipelineError:
         timings["total"] = round(time.perf_counter() - total_start, 3)
@@ -363,6 +379,7 @@ def run(
             "status": "error",
             "stage": stage,
             "error": str(exc),
+            "input_kind": input_kind,
             "created": datetime.now(timezone.utc).isoformat(),
             "input": {
                 "path": str(input_path),
@@ -387,35 +404,59 @@ def run(
         )
 
     if not input_path.is_file():
-        raise error_meta("preprocess", FileNotFoundError(f"Input audio does not exist: {input_path}"))
+        raise error_meta("preprocess", FileNotFoundError(f"Input file does not exist: {input_path}"))
     if input_size == 0:
-        raise error_meta("preprocess", ValueError(f"Input audio is empty: {input_path}"))
+        raise error_meta("preprocess", ValueError(f"Input file is empty: {input_path}"))
 
-    # Normalize to 44.1 kHz WAV + BPM estimate.
+    midi_events: dict[str, list[NoteEvent]] = {}
     reporter.emit_stage("preprocess", 0, "开始预处理")
     t0 = time.perf_counter()
-    try:
-        audio = preprocess_mod.prepare(
+    if is_midi:
+        # A MIDI file is already the transcription; skip WAV conversion too.
+        try:
+            imported = midi_in.prepare(input_path, options, logger=logger)
+        except Exception as exc:
+            logger.exception("MIDI import failed")
+            raise error_meta("preprocess", exc) from exc
+        warnings.extend(imported.warnings)
+        midi_events = imported.events
+        audio = PreprocessedAudio(
             input_path,
-            work_dir,
-            options,
-            logger=logger,
-            progress_cb=reporter.stage_cb("preprocess"),
+            imported.duration_s,
+            samplerate=0,
+            bpm=(
+                float(options.bpm_override)
+                if options.bpm_override is not None
+                else imported.bpm
+            ),
         )
-    except Exception as exc:
-        logger.exception("preprocess failed")
-        raise error_meta("preprocess", exc) from exc
+        reporter.emit_stage("preprocess", 100, "MIDI 读取完成")
+    else:
+        # Normalize to 44.1 kHz WAV + BPM estimate.
+        try:
+            audio = preprocess_mod.prepare(
+                input_path,
+                work_dir,
+                options,
+                logger=logger,
+                progress_cb=reporter.stage_cb("preprocess"),
+            )
+        except Exception as exc:
+            logger.exception("preprocess failed")
+            raise error_meta("preprocess", exc) from exc
+        warnings.extend(audio.warnings)
+        reporter.emit_stage("preprocess", 100, "预处理完成")
     stage_times["preprocess"] = round(time.perf_counter() - t0, 3)
-    warnings.extend(audio.warnings)
-    reporter.emit_stage("preprocess", 100, "预处理完成")
     logger.info("preprocess: bpm=%.2f duration=%.2f", audio.bpm, audio.duration_s)
 
     # Rhythm phase. The meter is always user-selected in this build. Automatic
-    # downbeat analysis still exists for 4/4; other meters either use the
-    # manual downbeat time or start bar 1 at the audio origin.
+    # downbeat analysis is meter-aware: madmom for 4/4, librosa accent phase
+    # for every other signature.
     meter = options.meter
     manual_downbeat_s = options.manual_downbeat_s
-    if (
+    if is_midi:
+        manual_downbeat_s = None
+    elif (
         manual_downbeat_s is not None
         and manual_downbeat_s > audio.duration_s + 0.05
     ):
@@ -425,9 +466,9 @@ def run(
         )
         manual_downbeat_s = None
     auto_alignment = (
-        options.align_downbeats
+        not is_midi
+        and options.align_downbeats
         and manual_downbeat_s is None
-        and meter.label == "4/4"
     )
     reporter.emit_stage(
         "rhythm",
@@ -436,18 +477,14 @@ def run(
     )
     t0 = time.perf_counter()
     rhythm_info: rhythm_mod.RhythmInfo | None = None
-    if manual_downbeat_s is not None:
+    if is_midi:
+        rhythm_mode = "midi"
+        reporter.emit_stage("rhythm", 100, "MIDI 输入：沿用文件时间轴")
+    elif manual_downbeat_s is not None:
         rhythm_mode = "manual"
         reporter.emit_stage(
             "rhythm", 100, f"手动强拍 {manual_downbeat_s:.2f}s"
         )
-    elif options.align_downbeats and meter.label != "4/4":
-        rhythm_mode = "unsupported-meter"
-        warnings.append(
-            f"自动强拍分析目前只支持 4/4；当前拍号 {meter.label}，"
-            "第 1 小节从音频开头开始。可在高级参数填写手动强拍位置。"
-        )
-        reporter.emit_stage("rhythm", 100, "非 4/4：未自动对齐强拍")
     elif options.align_downbeats:
         rhythm_mode = "auto"
         try:
@@ -455,6 +492,7 @@ def run(
                 audio.path,
                 logger=logger,
                 progress_cb=reporter.stage_cb("rhythm"),
+                meter=meter,
             )
         except Exception as exc:  # defensive: analyze_rhythm is non-fatal itself
             logger.exception("rhythm analysis failed; continuing without alignment")
@@ -479,63 +517,91 @@ def run(
         "rhythm: meter=%s mode=%s method=%s bpm=%.2f first_downbeat=%s manual=%s",
         meter.label,
         rhythm_mode,
-        rhythm_info.method if rhythm_info else "off",
+        "midi" if is_midi else rhythm_info.method if rhythm_info else "off",
         audio.bpm,
         rhythm_info.first_downbeat_s if rhythm_info else None,
         manual_downbeat_s,
     )
 
-    # Resolve the device before Demucs starts; a missing torch is a setup error.
-    try:
-        device, device_warnings = resolve_device(options.device)
-    except Exception as exc:
-        logger.exception("device resolution failed")
-        raise error_meta("separate", exc) from exc
-    warnings.extend(device_warnings)
-    logger.info("device: %s", device)
-
-    # Demucs separation.
-    reporter.emit_stage("separate", 0, "开始分离")
     t0 = time.perf_counter()
-    try:
-        stems_work, sep_warnings, used_device = separate_mod.separate(
-            audio,
-            options,
-            device,
-            logger=logger,
-            progress_cb=reporter.stage_cb("separate"),
+    playback_stems: dict[str, Path] = {}
+    if is_midi:
+        used_device = "midi"
+        stems_work: dict[str, Path] = {}
+        selected = tuple(
+            name
+            for name in STEM_NAMES
+            if name in options.selected_stems and name in midi_events
         )
-    except Exception as exc:
-        logger.exception("separation failed")
-        raise error_meta("separate", exc) from exc
-    warnings.extend(sep_warnings)
-    selected = options.selected_stems
-    missing = [name for name in selected if name not in stems_work]
-    if missing:
-        raise error_meta("separate", RuntimeError(f"Demucs did not return: {', '.join(missing)}"))
-    stage_times["separate"] = round(time.perf_counter() - t0, 3)
-    logger.info("separation device: %s; selected stems: %s", used_device, selected)
-
-    playback_stems: dict[str, Path] = {
-        name: Path(stems_work[name]).resolve() for name in selected
-    }
-    if options.keep_stems:
+        if not selected:
+            raise error_meta(
+                "separate",
+                ValueError(
+                    "MIDI 中没有与所选声部匹配的音符；请勾选文件中存在的声部"
+                ),
+            )
+        reporter.emit_stage("separate", 100, "MIDI 输入：跳过分轨")
+        logger.info("MIDI input; selected stems: %s", selected)
+    else:
+        # Resolve the device before Demucs starts; a missing torch is a setup error.
         try:
-            for name in selected:
-                playback_stems[name] = copy_file(
-                    stems_work[name],
-                    out_dir / "stems" / f"{name}.wav",
-                ).resolve()
+            device, device_warnings = resolve_device(options.device)
         except Exception as exc:
-            logger.exception("could not copy stems to output")
+            logger.exception("device resolution failed")
             raise error_meta("separate", exc) from exc
-    reporter.emit_stage("separate", 100, "分轨完成")
+        warnings.extend(device_warnings)
+        logger.info("device: %s", device)
+
+        # Demucs separation.
+        reporter.emit_stage("separate", 0, "开始分离")
+        try:
+            stems_work, sep_warnings, used_device = separate_mod.separate(
+                audio,
+                options,
+                device,
+                logger=logger,
+                progress_cb=reporter.stage_cb("separate"),
+            )
+        except Exception as exc:
+            logger.exception("separation failed")
+            raise error_meta("separate", exc) from exc
+        warnings.extend(sep_warnings)
+        selected = options.selected_stems
+        missing = [name for name in selected if name not in stems_work]
+        if missing:
+            raise error_meta(
+                "separate",
+                RuntimeError(f"Demucs did not return: {', '.join(missing)}"),
+            )
+        logger.info("separation device: %s; selected stems: %s", used_device, selected)
+
+        playback_stems = {
+            name: Path(stems_work[name]).resolve() for name in selected
+        }
+        if options.keep_stems:
+            try:
+                for name in selected:
+                    playback_stems[name] = copy_file(
+                        stems_work[name],
+                        out_dir / "stems" / f"{name}.wav",
+                    ).resolve()
+            except Exception as exc:
+                logger.exception("could not copy stems to output")
+                raise error_meta("separate", exc) from exc
+        reporter.emit_stage("separate", 100, "分轨完成")
+    stage_times["separate"] = round(time.perf_counter() - t0, 3)
 
     # Musical context from the separated stems: the drum stem is a cleaner
     # tempo reference than the full mix, and harmonic stems give a useful key.
-    reporter.emit_stage("analyze", 0, "分析速度与调性")
+    reporter.emit_stage(
+        "analyze", 0, "读取 MIDI 时间轴" if is_midi else "分析速度与调性"
+    )
     t0 = time.perf_counter()
-    tempo_source = rhythm_info.tempo_source if rhythm_info is not None else "mix"
+    tempo_source = (
+        "midi"
+        if is_midi
+        else rhythm_info.tempo_source if rhythm_info is not None else "mix"
+    )
     if options.bpm_override is not None:
         tempo_source = "override"
     elif (
@@ -555,10 +621,12 @@ def run(
             rhythm_info.bpm = audio.bpm
             rhythm_info.tempo_source = tempo_source
         logger.info("tempo: %.2f BPM (source=%s)", audio.bpm, tempo_source)
-    reporter.emit_stage("analyze", 45, "估计调性")
+    reporter.emit_stage(
+        "analyze", 45, "MIDI 输入：跳过调性分析" if is_midi else "估计调性"
+    )
 
     key_info: keydetect_mod.KeyInfo | None = None
-    if options.detect_key:
+    if options.detect_key and not is_midi:
         harmonic_sources = [
             stems_work[name]
             for name in ("other", "bass", "vocals")
@@ -573,10 +641,12 @@ def run(
             except Exception as exc:  # defensive: detection must stay optional
                 logger.exception("key detection failed")
                 warnings.append(f"key detection failed ({exc}); GP5 stays in C major")
-        else:
+        elif not is_midi:
             warnings.append("key detection skipped: no harmonic stems available")
+    if is_midi:
+        warnings.append("MIDI 输入：跳过调性检测、鼓速校正与音频和弦分析")
     key_meta = {
-        "enabled": bool(options.detect_key),
+        "enabled": bool(options.detect_key) and not is_midi,
         "detected": key_info is not None,
         "name": key_info.name if key_info is not None else None,
         "tonic": int(key_info.tonic) if key_info is not None else None,
@@ -589,7 +659,11 @@ def run(
     reporter.emit_stage(
         "analyze",
         100,
-        f"调性：{key_info.name}" if key_info is not None else "调性未确定（保持 C 大调）",
+        "MIDI 输入：跳过速度/调性分析"
+        if is_midi
+        else f"调性：{key_info.name}"
+        if key_info is not None
+        else "调性未确定（保持 C 大调）",
     )
 
     # Basic Pitch (vocals/bass/other) plus the drum heuristic. Only selected
@@ -619,49 +693,80 @@ def run(
         )
 
     melodic_events: dict[str, list[NoteEvent]] = {}
+    drum_events: list[NoteEvent] = []
     tr_warnings: list[str] = []
-    if melodic_selected:
-        try:
-            melodic_events, tr_warnings = transcribe_mod.transcribe_stems(
-                {name: stems_work[name] for name in melodic_selected},
-                options,
-                audio.bpm,
-                logger=logger,
-                progress_cb=melodic_progress,
-            )
-        except Exception as exc:
-            logger.exception("Basic Pitch transcription failed")
-            raise error_meta("transcribe", exc) from exc
-    elif drums_selected:
-        reporter.emit_stage("transcribe", 0, "未选择旋律分轨，跳过 Basic Pitch")
-    warnings.extend(tr_warnings)
-
-    drum_events = []
     drum_warnings: list[str] = []
-    if drums_selected:
-        try:
-            drum_events, drum_warnings = drums_mod.transcribe_drums(
-                stems_work["drums"],
-                audio.bpm,
-                options.quantize,
-                logger=logger,
-                progress_cb=drum_progress,
-            )
-        except Exception as exc:
-            logger.exception("drum transcription failed; continuing with empty drums")
-            warnings.append(f"drum transcription failed; wrote an empty drum track: {exc}")
-            drum_events = []
-            drum_warnings = []
-    elif melodic_selected:
-        reporter.emit_stage("transcribe", 100, "未选择鼓轨，跳过鼓点转录")
-    warnings.extend(drum_warnings)
+    if is_midi:
+        melodic_events = {
+            name: list(midi_events.get(name, [])) for name in melodic_selected
+        }
+        if drums_selected:
+            drum_events = list(midi_events.get("drums", []))
+        reporter.emit_stage("transcribe", 100, "MIDI 输入：跳过转录")
+    else:
+        if melodic_selected:
+            melodic_stems = {name: stems_work[name] for name in melodic_selected}
+            try:
+                if options.transcription_engine == "external":
+                    try:
+                        melodic_events, tr_warnings = engines.transcribe_external(
+                            melodic_stems,
+                            options,
+                            audio.bpm,
+                            logger=logger,
+                            progress_cb=melodic_progress,
+                        )
+                    except Exception as exc:
+                        logger.exception("external transcription engine failed")
+                        warnings.append(
+                            f"外部转录引擎失败，已回退 Basic Pitch：{exc}"
+                        )
+                        melodic_events, tr_warnings = transcribe_mod.transcribe_stems(
+                            melodic_stems,
+                            options,
+                            audio.bpm,
+                            logger=logger,
+                            progress_cb=melodic_progress,
+                        )
+                else:
+                    melodic_events, tr_warnings = transcribe_mod.transcribe_stems(
+                        melodic_stems,
+                        options,
+                        audio.bpm,
+                        logger=logger,
+                        progress_cb=melodic_progress,
+                    )
+            except Exception as exc:
+                logger.exception("Basic Pitch transcription failed")
+                raise error_meta("transcribe", exc) from exc
+        elif drums_selected:
+            reporter.emit_stage("transcribe", 0, "未选择旋律分轨，跳过 Basic Pitch")
+        warnings.extend(tr_warnings)
+
+        if drums_selected:
+            try:
+                drum_events, drum_warnings = drums_mod.transcribe_drums(
+                    stems_work["drums"],
+                    audio.bpm,
+                    options.quantize,
+                    logger=logger,
+                    progress_cb=drum_progress,
+                )
+            except Exception as exc:
+                logger.exception("drum transcription failed; continuing with empty drums")
+                warnings.append(f"drum transcription failed; wrote an empty drum track: {exc}")
+                drum_events = []
+                drum_warnings = []
+        elif melodic_selected:
+            reporter.emit_stage("transcribe", 100, "未选择鼓轨，跳过鼓点转录")
+        warnings.extend(drum_warnings)
+        reporter.emit_stage("transcribe", 100, "转录完成")
     events = {
         name: list(melodic_events.get(name, [])) for name in melodic_selected
     }
     if drums_selected:
         events["drums"] = list(drum_events)
     stage_times["transcribe"] = round(time.perf_counter() - t0, 3)
-    reporter.emit_stage("transcribe", 100, "转录完成")
 
     # Snap the bar grid to the detected downbeats. If transcription found
     # material before the first downbeat, choose_grid_offset keeps it in
@@ -697,6 +802,7 @@ def run(
     reporter.emit_stage("post", 0, "整理音符")
     t0 = time.perf_counter()
     chords: list[ChordEvent] = []
+    chords_doc: dict = {}
     chords_path: Path | None = None
     try:
         cleaned = midi_post.clean(
@@ -725,7 +831,7 @@ def run(
             meter=meter,
         )
 
-        if options.detect_chords:
+        if options.detect_chords and not is_midi:
             reporter.emit_stage("post", 50, "分析和弦")
             harmonic_stems = {
                 name: stems_work[name]
@@ -777,6 +883,8 @@ def run(
                 len(chords),
                 chords_doc["summary"]["progression"],
             )
+        elif is_midi:
+            reporter.emit_stage("post", 85, "MIDI 输入：跳过和弦分析")
         else:
             reporter.emit_stage("post", 85, "和弦分析已关闭")
 
@@ -788,6 +896,13 @@ def run(
             stems=selected,
             chords=chords if options.detect_chords else None,
             time_signature=meter.label,
+        )
+        # Snapshot the untouched transcription so the editor can compare edits
+        # against the reference after full.mid has been regenerated. For MIDI
+        # input the uploaded file itself is that reference.
+        copy_file(
+            input_path if is_midi else full_midi,
+            out_dir / "midi" / "reference.mid",
         )
     except Exception as exc:
         logger.exception("MIDI cleanup/post-processing failed")
@@ -871,6 +986,7 @@ def run(
     files: dict[str, object] = {
         "midi": {name: f"midi/{name}.mid" for name in selected},
         "full_midi": "midi/full.mid",
+        "reference_midi": "midi/reference.mid",
         "meta": "meta.json",
         "zip": zip_name,
     }
@@ -880,7 +996,7 @@ def run(
         files["tracks"] = "tracks.json"
     if chords_path is not None:
         files["chords"] = "chords.json"
-    if options.keep_stems:
+    if options.keep_stems and playback_stems:
         files["stems"] = {name: f"stems/{name}.wav" for name in selected}
 
     manual_reference = manual_downbeat_s if rhythm_mode == "manual" else None
@@ -888,7 +1004,8 @@ def run(
         "enabled": bool(options.align_downbeats),
         "mode": rhythm_mode,
         "method": (
-            "manual" if rhythm_mode == "manual"
+            "midi" if is_midi
+            else "manual" if rhythm_mode == "manual"
             else rhythm_info.method if rhythm_info
             else "off"
         ),
@@ -916,7 +1033,7 @@ def run(
         "downbeat_count": (
             len(rhythm_info.downbeat_times_s) if rhythm_info else 0
         ),
-        "auto_alignment_supported": meter.label == "4/4",
+        "auto_alignment_supported": True,
     }
 
     meta = {
@@ -936,6 +1053,7 @@ def run(
         },
         "options": options.to_meta(),
         "output_format": options.output_format,
+        "input_kind": input_kind,
         "device": used_device,
         "selected_stems": list(selected),
         "time_signature": meter.label,

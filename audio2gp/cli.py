@@ -26,7 +26,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("input", type=Path, help="input audio file (MP3/WAV/etc.)")
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="input audio (MP3/WAV/etc.) or MIDI (.mid/.midi); MIDI skips separation and transcription",
+    )
     parser.add_argument("-o", "--output", type=Path, default=Path("output"), help="output root")
     parser.add_argument("--work-dir", type=Path, default=Path("work"), help="work root")
     parser.add_argument(
@@ -34,6 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("htdemucs_ft", "htdemucs"),
         default="htdemucs_ft",
         help="Demucs model (ft is slower and generally better)",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=("basic_pitch", "external"),
+        default="basic_pitch",
+        help=(
+            "melodic transcriber; external runs AUDIO2GP_EXTERNAL_CMD per stem "
+            "and falls back to Basic Pitch on failure"
+        ),
     )
     parser.add_argument(
         "--quantize",
@@ -75,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--bpm",
         type=float,
         default=0.0,
-        help="BPM override; 0 estimates from the audio",
+        help="BPM override (20-300); 0 estimates from the audio",
     )
     parser.add_argument(
         "--time-signature",
@@ -94,15 +107,15 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help=(
             "time of the first downbeat in the source audio; overrides "
-            "automatic analysis and works with every meter (0 = not set)"
+            "automatic analysis and works with every meter (0 = not set; "
+            "ignored for MIDI input)"
         ),
     )
     parser.add_argument(
         "--no-align-downbeats",
         action="store_true",
         help=(
-            "do not analyze downbeats; keep bar 1 at the audio start "
-            "(automatic downbeat analysis itself is 4/4-only)"
+            "do not analyze downbeats; keep bar 1 at the audio start"
         ),
     )
     parser.add_argument(
@@ -219,6 +232,7 @@ def _options_from_args(args: argparse.Namespace) -> Options:
         output_dir=args.output,
         work_dir=args.work_dir,
         demucs_model=args.model,
+        transcription_engine=args.engine,
         quantize=args.quantize,
         guitar_stem=args.guitar_stem,
         keep_stems=not args.no_keep_stems,
@@ -272,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     if not args.input.is_file():
-        print(f"error: input audio does not exist: {args.input}", file=sys.stderr)
+        print(f"error: input file does not exist: {args.input}", file=sys.stderr)
         return 1
 
     try:

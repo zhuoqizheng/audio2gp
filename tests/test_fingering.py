@@ -88,6 +88,23 @@ def test_drop_when_folding_cannot_make_a_legal_chord() -> None:
     _assert_legal(result, TUNING_GUITAR, 15)
 
 
+def test_fallback_drops_the_quietest_note_not_the_most_versatile() -> None:
+    # 88 and 89 only fit on string 1 (folded), so the full chord is illegal.
+    # The quiet 89 must go first; the strong 62 is playable and must stay.
+    notes = [
+        _note(0, 960, 88, 120),
+        _note(0, 960, 62, 90),
+        _note(0, 960, 89, 30),
+    ]
+    result, warnings = arrange_guitar(notes)
+    pitches = {note.pitch for note in result}
+    assert 76 in pitches  # the strong 88 survives (folded)
+    assert 77 not in pitches  # the quiet 89 was dropped
+    assert pitches & {50, 62, 74}  # the 62 note survives, possibly folded
+    assert any("dropped the weakest note" in warning for warning in warnings)
+    _assert_legal(result, TUNING_GUITAR, 15)
+
+
 def test_sequence_keeps_a_narrow_hand_position() -> None:
     notes = [_note(i * 480, (i + 1) * 480, pitch) for i, pitch in enumerate(range(60, 68))]
     result, warnings = arrange_guitar(notes, max_fret=15)
@@ -108,7 +125,7 @@ def test_bass_uses_bass_tuning_and_lowest_note() -> None:
 
 def test_vocals_are_monophonic_and_keep_strongest_note() -> None:
     result, warnings = arrange_vocals(
-        [_note(0, 480, 60, 80), _note(0, 480, 64, 40)]
+        [_note(0, 480, 60, 80), _note(0, 480, 64, 40)], max_fret=24
     )
     assert warnings == []
     assert len(result) == 1

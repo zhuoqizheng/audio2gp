@@ -8,7 +8,7 @@ from typing import Callable
 
 import numpy as np
 
-from .config import BEATS_PER_BAR, bar_seconds
+from .config import BEATS_PER_BAR, Meter, bar_seconds, parse_time_signature
 
 LocalCB = Callable[[float, str], None]
 
@@ -19,6 +19,8 @@ def _emit(cb: LocalCB | None, pct: float, message: str) -> None:
 
 
 def _fold_bpm(bpm: float) -> float:
+    if not math.isfinite(bpm) or bpm <= 0:
+        raise ValueError(f"invalid tempo {bpm!r}")
     while bpm < 60:
         bpm *= 2
     while bpm > 180:
@@ -47,13 +49,14 @@ def _analyze_madmom(
     wav_path: Path,
     logger: logging.Logger | None,
     progress_cb: LocalCB | None,
+    *,
+    beats_per_bar: int = BEATS_PER_BAR,
 ) -> RhythmInfo:
     """Joint beat/downbeat tracking with madmom's BLSTM ensemble.
 
     The source audio is already normalized to 44.1 kHz by preprocess.prepare,
-    which RNNDownBeatProcessor requires. We deliberately request a four-beat
-    bar: this app writes 4/4 GP5 files, and letting a generic meter detector
-    choose between 3 and 4 can pick 3/4 for a swung 4/4 song.
+    which RNNDownBeatProcessor requires. This decoder is only used for 4/4:
+    the meter is user-selected, and the model is trained around four-beat bars.
     """
     from madmom_infer.features.downbeats import (
         DBNDownBeatTrackingProcessor,
@@ -68,7 +71,7 @@ def _analyze_madmom(
         raise ValueError("downbeat model returned no activations")
     _emit(progress_cb, 80, "解码节拍与强拍")
     tracker = DBNDownBeatTrackingProcessor(
-        beats_per_bar=[BEATS_PER_BAR],
+        beats_per_bar=[beats_per_bar],
         fps=100,
     )
     tracked = tracker(activations)
@@ -87,8 +90,6 @@ def _analyze_madmom(
     if intervals.size == 0:
         raise ValueError("beat intervals are not usable")
     bpm = _fold_bpm(60.0 / float(np.median(intervals)))
-    if not math.isfinite(bpm) or bpm <= 0:
-        raise ValueError(f"invalid detected BPM {bpm!r}")
 
     if logger:
         logger.info(
@@ -100,7 +101,7 @@ def _analyze_madmom(
     _emit(progress_cb, 100, f"强拍分析完成（{bpm:.1f} BPM）")
     return RhythmInfo(
         bpm=round(float(bpm), 2),
-        beats_per_bar=BEATS_PER_BAR,
+        beats_per_bar=beats_per_bar,
         beat_times_s=[float(value) for value in beats],
         downbeat_times_s=[float(value) for value in downbeats],
         method="madmom-infer",
@@ -113,6 +114,7 @@ def _accent_phase_score(
     onset_strength: np.ndarray,
     sr: int,
     hop_length: int,
+    beats_per_bar: int = BEATS_PER_BAR,
 ) -> int:
     """Choose the most accented beat phase as the (fallback) bar start.
 
@@ -139,7 +141,10 @@ def _accent_phase_score(
         return (values - median) / scale
 
     score = robust_z(low) + 0.35 * robust_z(onset)
-    phase_scores = [float(np.mean(score[phase::BEATS_PER_BAR])) for phase in range(BEATS_PER_BAR)]
+    phase_scores = [
+        float(np.mean(score[phase::beats_per_bar]))
+        for phase in range(beats_per_bar)
+    ]
     return int(np.argmax(phase_scores))
 
 
@@ -147,10 +152,13 @@ def _analyze_librosa(
     wav_path: Path,
     logger: logging.Logger | None,
     progress_cb: LocalCB | None,
+    *,
+    meter: Meter | str = "4/4",
 ) -> RhythmInfo:
     """Dependency-light fallback: librosa beats + low-band accent phase."""
     import librosa
 
+    meter = parse_time_signature(meter)
     _emit(progress_cb, 10, "分析节拍（librosa）")
     y, sr = librosa.load(str(wav_path), sr=22050, mono=True)
     if y.size < sr // 2:
@@ -160,11 +168,21 @@ def _analyze_librosa(
         perc = y
     tempo, frames = librosa.beat.beat_track(y=perc, sr=sr, units="frames")
     beat_times = np.asarray(librosa.frames_to_time(frames, sr=sr), dtype=float)
-    if beat_times.size < BEATS_PER_BAR:
+    diffs = np.diff(beat_times)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0.05)]
+    if beat_times.size < 2 or diffs.size == 0:
         raise ValueError("librosa found too few beats")
+    median_interval = float(np.median(diffs))
+    raw_bpm = 60.0 / median_interval
     bpm = _fold_bpm(float(np.atleast_1d(tempo)[0]))
-    if not math.isfinite(bpm) or bpm <= 0:
-        raise ValueError(f"invalid tempo {bpm!r}")
+    # How many detected beats make one user-selected bar. BPM is defined as
+    # quarter-note BPM, so this is the bar length in beats at the detected
+    # interval. It works for simple and compound meters without assuming 4/4.
+    beats_per_bar = max(
+        1, int(round(meter.bar_seconds(raw_bpm) / median_interval))
+    )
+    if beat_times.size < beats_per_bar:
+        raise ValueError("librosa found too few beats for one bar")
 
     _emit(progress_cb, 65, "估计强拍相位")
     hop_length = 512
@@ -179,9 +197,14 @@ def _analyze_librosa(
         y=y, sr=sr, hop_length=hop_length
     )
     phase = _accent_phase_score(
-        beat_times, low_energy, onset_strength, sr, hop_length
+        beat_times,
+        low_energy,
+        onset_strength,
+        sr,
+        hop_length,
+        beats_per_bar=beats_per_bar,
     )
-    downbeats = beat_times[phase::BEATS_PER_BAR]
+    downbeats = beat_times[phase::beats_per_bar]
     if downbeats.size == 0:
         raise ValueError("no downbeat phase found")
 
@@ -195,7 +218,7 @@ def _analyze_librosa(
     _emit(progress_cb, 100, f"强拍分析完成（librosa，{bpm:.1f} BPM）")
     return RhythmInfo(
         bpm=round(float(bpm), 2),
-        beats_per_bar=BEATS_PER_BAR,
+        beats_per_bar=beats_per_bar,
         beat_times_s=[float(value) for value in beat_times],
         downbeat_times_s=[float(value) for value in downbeats],
         method="librosa-accent",
@@ -206,25 +229,37 @@ def analyze_rhythm(
     wav_path: Path | str,
     logger: logging.Logger | None = None,
     progress_cb: LocalCB | None = None,
+    *,
+    meter: Meter | str = "4/4",
 ) -> RhythmInfo:
     """Analyze beats/downbeats, preferring madmom-infer and falling back.
 
-    Model weights are fetched and cached by madmom-infer on first use. Any
-    model/network problem is non-fatal: librosa's beat tracker plus a
-    low-band accent phase keeps the app usable offline.
+    madmom is used for 4/4 only; every other user-selected meter uses the
+    librosa beat tracker with a meter-aware accent phase. Model weights are
+    fetched and cached by madmom-infer on first use. Any model/network problem
+    is non-fatal: the librosa path keeps the app usable offline.
     """
     wav_path = Path(wav_path)
+    meter = parse_time_signature(meter)
     warnings: list[str] = []
-    try:
-        return _analyze_madmom(wav_path, logger, progress_cb)
-    except Exception as exc:
-        message = f"madmom-infer downbeat analysis failed ({type(exc).__name__}: {exc}); using librosa fallback"
-        warnings.append(message)
-        if logger:
-            logger.warning(message)
+    if meter.label == "4/4":
+        try:
+            return _analyze_madmom(
+                wav_path,
+                logger,
+                progress_cb,
+                beats_per_bar=meter.pulses_per_bar,
+            )
+        except Exception as exc:
+            message = f"madmom-infer downbeat analysis failed ({type(exc).__name__}: {exc}); using librosa fallback"
+            warnings.append(message)
+            if logger:
+                logger.warning(message)
+    elif logger:
+        logger.info("rhythm: %s uses the librosa accent tracker (madmom is 4/4-only)", meter.label)
 
     try:
-        info = _analyze_librosa(wav_path, logger, progress_cb)
+        info = _analyze_librosa(wav_path, logger, progress_cb, meter=meter)
         info.warnings = warnings + info.warnings
         return info
     except Exception as exc:
@@ -235,7 +270,7 @@ def analyze_rhythm(
         _emit(progress_cb, 100, "强拍分析失败，保持原始时间轴")
         return RhythmInfo(
             bpm=0.0,
-            beats_per_bar=BEATS_PER_BAR,
+            beats_per_bar=meter.pulses_per_bar,
             warnings=warnings,
             method="none",
         )
@@ -278,8 +313,6 @@ def refine_tempo_from_drums(
         else:
             bpm = float(np.atleast_1d(tempo)[0])
         bpm = _fold_bpm(bpm)
-        if not math.isfinite(bpm) or bpm <= 0:
-            raise ValueError(f"invalid drum tempo {bpm!r}")
 
         reference = _fold_bpm(float(reference_bpm)) if reference_bpm > 0 else 0.0
         if reference > 0:

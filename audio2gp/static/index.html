@@ -10,9 +10,8 @@
 <body>
   <header class="site-header">
     <div>
-      <p class="eyebrow">LOCAL · OFFLINE · RTX 4090</p>
       <h1>audio2gp</h1>
-      <p class="lede">把一首完整混音拆成鼓、贝斯、人声和其他声部，自动记谱、分析和弦，并导出可继续编辑的多轨 <strong>.gp5</strong>；也可以只导出 MIDI。</p>
+      <p class="lede">把一首完整混音拆成鼓、贝斯、人声和其他声部，自动记谱、分析和弦，并导出可继续编辑的多轨 <strong>.gp5</strong>；也可以直接导入 MIDI，或只导出 MIDI。</p>
     </div>
     <div class="badge-stack" aria-label="运行方式">
       <span class="badge">仅监听 127.0.0.1</span>
@@ -25,7 +24,7 @@
     <section class="card" id="uploadPanel">
       <div class="card-head">
         <div>
-          <p class="step">STEP 1</p>
+          <p class="step">01</p>
           <h2>上传与参数</h2>
         </div>
         <p class="card-note">支持 MP3、WAV、FLAC、M4A、OGG 等。<span id="limitsNote">默认上限 200 MB / 10 分钟，可在启动参数中调整。</span></p>
@@ -34,12 +33,13 @@
       <form id="jobForm" novalidate>
         <div class="upload-row">
           <label class="file-drop" for="fileInput">
-            <input id="fileInput" name="file" type="file" accept="audio/*,.wav,.mp3,.flac,.m4a,.aac,.ogg,.oga,.aif,.aiff" required>
-            <span class="file-title">选择完整混音文件</span>
-            <span class="file-hint" id="fileHint">点击选择，或把文件拖到这里。请使用包含全部乐器的成品混音，而不是单独乐器轨。</span>
+            <input id="fileInput" name="file" type="file" accept="audio/*,.wav,.mp3,.flac,.m4a,.aac,.ogg,.oga,.aif,.aiff,.mid,.midi" required>
+            <span class="file-title">选择完整混音或 MIDI 文件</span>
+            <span class="file-hint" id="fileHint">点击选择，或把文件拖到这里。音频请使用包含全部乐器的成品混音；也可以直接上传 .mid/.midi 跳过分离与转录。</span>
           </label>
           <div class="upload-aside">
             <p><strong>为什么需要完整混音？</strong> Demucs 会先从混音中分离四类声部，再分别转谱。若你已经有干净的单独轨，也可以把该轨当作混音上传，并在“参与转谱的声部”中只勾选对应声部。</p>
+            <p><strong>MIDI 输入：</strong>上传 .mid/.midi 时跳过分轨、转录、调性检测与音频和弦分析。音轨按 MIDI 通道 9、轨道名和 GM 音色归入鼓/贝斯/人声/其他，并在下方勾选的声部范围内导出；速度取自文件首个速度事件，仅保留单一速度，拍号仍以页面选择为准。Demucs 模型、转录引擎与设备设置对 MIDI 输入不生效。</p>
             <p><strong>隐私：</strong>所有模型推理、量化、GP5 生成均在本机完成；浏览器只访问 localhost。</p>
           </div>
         </div>
@@ -51,7 +51,16 @@
               <option value="htdemucs_ft" selected>htdemucs_ft — 高质量（推荐）</option>
               <option value="htdemucs">htdemucs — 更快</option>
             </select>
-            <small>首次使用会下载约 321 MB 权重并缓存到本机。高质量模型对吉他、人声的串音更少。</small>
+            <small>首次使用会下载约 321 MB 权重并缓存到本机。高质量模型对吉他、人声的串音更少；MIDI 输入不使用该模型。</small>
+          </label>
+
+          <label class="field">
+            <span class="label">旋律转录引擎 <button type="button" class="info" aria-label="说明" data-tip="Basic Pitch 是内置模型。外部引擎通过环境变量 AUDIO2GP_EXTERNAL_CMD 配置，本机命令会按声部收到 {wav}、{stem}、{out}、{bpm} 参数并写出 MIDI；音频不会离开本机。命令未配置或失败时自动回退 Basic Pitch 并给出警告。">i</button></span>
+            <select id="engineSelect">
+              <option value="basic_pitch" selected>Basic Pitch — 内置（推荐）</option>
+              <option value="external">外部引擎 — 需要配置命令</option>
+            </select>
+            <small id="engineHint">外部引擎逐声部运行本机命令并读取它写出的 MIDI；鼓轨始终使用内置识别。失败时回退 Basic Pitch，不会中断任务。MIDI 输入本身已是转录结果，不会调用任何转录引擎。</small>
           </label>
 
           <label class="field">
@@ -122,9 +131,9 @@
           </label>
 
           <label class="field">
-            <span class="label">速度覆盖（BPM） <button type="button" class="info" aria-label="说明" data-tip="填 0 表示自动。自动流程先用整曲节拍，再用鼓声部在 70–180 BPM 内验证，处理半速/倍速歧义。">i</button></span>
+            <span class="label">速度覆盖（BPM） <button type="button" class="info" aria-label="说明" data-tip="填 0 表示自动；手动填写时范围为 20–300。自动流程先用整曲节拍，再用鼓声部在 70–180 BPM 内验证，处理半速/倍速歧义。">i</button></span>
             <input id="bpmOverride" type="number" min="0" max="300" step="0.1" value="0">
-            <small>0 = 自动。若自动速度出现半速/倍速错误，可在这里填入正确速度；这会关闭鼓点修正。</small>
+            <small>0 = 自动；手动填写范围 20–300。若自动速度出现半速/倍速错误，可在这里填入正确速度；这会关闭鼓点修正。</small>
           </label>
 
           <label class="field">
@@ -134,7 +143,7 @@
               <option value="cuda">强制 CUDA</option>
               <option value="cpu">CPU（很慢）</option>
             </select>
-            <small>RTX 4090 建议 auto/cuda。Basic Pitch 0.4 在本环境使用 TFLite CPU 推理，因此转录阶段仍会占用 CPU。</small>
+            <small>有 NVIDIA 显卡时 auto/cuda 更快；纯 CPU 也能运行，只是分离会明显变慢。Basic Pitch 在本环境使用 TFLite CPU 推理，因此转录阶段仍会占用 CPU。</small>
           </label>
         </div>
 
@@ -175,10 +184,10 @@
             <label class="field">
               <span class="label">对齐强拍</span>
               <label class="switch-row"><input id="alignDownbeats" type="checkbox" checked> <span>按检测到的强拍放置小节线</span></label>
-              <small>自动修复节拍网格，并把第一个强拍作为小节起点；开头不足一小节的内容会放入前置小节。自动强拍分析目前只支持 4/4；其他拍号请填写下方“手动强拍位置”，否则第 1 小节从音频开头开始。</small>
+              <small>自动修复节拍网格，并按所选拍号检测强拍：4/4 使用 madmom 强拍模型，其他拍号使用 librosa 节拍 + 低音重音相位。开头不足一小节的内容会放入前置小节。检测不理想时，可填写下方“手动强拍位置”覆盖自动结果。</small>
             </label>
             <label class="field">
-              <span class="label">手动强拍位置（秒） <button type="button" class="info" aria-label="说明" data-tip="填写音频中第一个强拍（小节第 1 拍）出现的时间。填写后不再运行自动强拍分析，适用于任何拍号；开头是弱起时，前面的内容会自动放入前置小节。">i</button></span>
+              <span class="label">手动强拍位置（秒） <button type="button" class="info" aria-label="说明" data-tip="填写音频中第一个强拍（小节第 1 拍）出现的时间。填写后不再运行自动强拍分析，适用于任何拍号；开头是弱起时，前面的内容会自动放入前置小节。MIDI 输入沿用文件时间轴，此设置不生效。">i</button></span>
               <input id="manualDownbeat" type="number" min="0" max="3600" step="0.01" value="0">
               <small>0 = 不手动指定。若你知道第一个强拍的时间（例如 0.85 秒），填这里可以绕过自动检测；该值优先于“对齐强拍”的自动结果，并适用于所有拍号。弱起/前奏会保留在前置小节中。</small>
             </label>
@@ -249,7 +258,7 @@
     <section class="card" id="jobPanel" hidden>
       <div class="card-head">
         <div>
-          <p class="step">STEP 2</p>
+          <p class="step">02</p>
           <h2>处理进度</h2>
         </div>
         <p class="card-note">任务在本机串行执行；首次运行需要加载 Demucs 权重。关闭页面不会中断已开始的本地任务。</p>
@@ -262,7 +271,7 @@
         <div class="progress-fill" id="progressFill"></div>
       </div>
       <p id="jobMessage" class="job-message">准备上传…</p>
-      <div class="log-wrap">
+      <div id="logWrap" class="log-wrap">
         <div class="log-head"><span>处理日志</span><span id="jobIdLabel"></span></div>
         <pre id="logBox" class="log-box"></pre>
       </div>
@@ -271,25 +280,13 @@
     <section class="card" id="resultPanel" hidden>
       <div class="card-head">
         <div>
-          <p class="step">STEP 3</p>
+          <p class="step">03</p>
           <h2 id="resultTitle">预览与轻量改谱</h2>
         </div>
         <p id="resultCardNote" class="card-note">alphaTab 负责在线显示与播放；浏览器不能写 GP5。每次修改都先写入 <code>tracks.json</code>，再由服务器的 PyGuitarPro 导出链路重新生成 <code>song.gp5</code>。</p>
       </div>
 
       <div id="summary" class="summary-grid"></div>
-
-      <section id="chordPanel" class="chord-panel" hidden>
-        <div class="chord-head">
-          <div>
-            <h3>和弦进行（自动分析）</h3>
-            <p class="hint">按量化后的小节/拍显示，与 MIDI 标记和 GP5 和弦符号使用同一套标签。置信度表示该拍最可能的和弦与第二候选的差距，不是人工校验结果；低置信度段落请结合试听判断。</p>
-          </div>
-          <span id="chordMeta" class="chord-meta"></span>
-        </div>
-        <p id="chordProgression" class="chord-progression"></p>
-        <div id="chordTimeline" class="chord-timeline"></div>
-      </section>
 
       <div id="noScoreNote" class="no-score-note" hidden>
         <strong id="noScoreTitle">本次没有可预览的 GP5。</strong>
@@ -299,8 +296,9 @@
       <div id="scoreWorkspace">
         <div class="score-toolbar">
         <button id="playBtn" type="button" class="secondary" disabled>▶ 播放</button>
+        <button id="undoBtn" type="button" class="secondary" disabled title="只保留最近一步：改弦/品、删除、整体移调或静音都会生成一个可撤销步骤。">↶ 撤销上一处修改</button>
         <span id="playPos" class="play-pos">尚未加载乐谱</span>
-        <span class="toolbar-hint">点击谱面中的音符查看可替换的弦/品；使用下方静音按钮试听各声部。</span>
+        <span class="toolbar-hint">点击音符改弦/品；撤销只回退最近一步，标记与 solo 不占用撤销步。</span>
       </div>
 
       <div class="editor-grid">
@@ -324,23 +322,52 @@
             <button id="applyPositionBtn" type="button" class="secondary">应用弦/品</button>
           </div>
           <button id="deleteNoteBtn" type="button" class="danger">删除这个音符</button>
+          <div class="flag-box">
+            <label class="switch-row"><input id="flagNote" type="checkbox"> <span>标记为需要人工检查</span></label>
+            <input id="flagReason" type="text" maxlength="200" placeholder="原因（可选），例如：这个和弦听起来不对">
+            <button id="applyFlagBtn" type="button" class="secondary">保存标记</button>
+            <p class="hint">标记写入 <code>flags.json</code>，不改谱面、不产生新 revision，也不会阻挡导出；删除音符时它的标记自动消失。</p>
+          </div>
           <p id="noteStatus" class="form-status" role="status"></p>
         </aside>
       </div>
 
         <div class="mixer">
           <div class="mixer-head">
-            <h3>轨道与静音</h3>
-            <p class="hint">静音会写入编辑状态并立即用于预览，同时重新导出 GP5/MIDI；导出文件仍保留该轨，取消静音即可恢复。</p>
+            <h3>轨道、静音与移调</h3>
+            <p class="hint">静音会写入编辑状态并重新导出 GP5/MIDI，导出文件仍保留该轨。solo（独奏）只影响浏览器试听，不写入文件；移调整轨会重新指法，超出最大品位的音会被删除，可用撤销恢复一步。</p>
           </div>
           <div id="trackMixer" class="mixer-list"></div>
         </div>
+
+        <section id="flagPanel" class="flag-panel" hidden>
+          <div class="chord-head">
+            <div>
+              <h3>人工检查标记</h3>
+              <p class="hint">这些音符在 <code>flags.json</code> 中被标出，便于导出后逐个核对；标记不会改变谱面或 MIDI。取消标记立即生效。</p>
+            </div>
+            <span id="flagMeta" class="chord-meta"></span>
+          </div>
+          <ul id="flagList" class="flag-list"></ul>
+        </section>
       </div>
+
+      <section id="chordPanel" class="chord-panel" hidden>
+        <div class="chord-head">
+          <div>
+            <h3>和弦进行（自动分析）</h3>
+            <p class="hint">按量化后的小节/拍显示，与 MIDI 标记和 GP5 和弦符号使用同一套标签。置信度表示该拍最可能的和弦与第二候选的差距，不是人工校验结果；低置信度段落请结合试听判断。</p>
+          </div>
+          <span id="chordMeta" class="chord-meta"></span>
+        </div>
+        <p id="chordProgression" class="chord-progression"></p>
+        <div id="chordTimeline" class="chord-timeline"></div>
+      </section>
 
       <div class="downloads">
         <h3>下载</h3>
         <div id="downloadLinks" class="download-links"></div>
-        <p class="hint">GP5 是草稿而非成品谱：拍号由你指定（不做自动识别）、近似鼓记谱、启发式指法与自动和弦；建议在 Guitar Pro 或 TuxGuitar 中继续调整。仅 MIDI 模式不会提供 GP5 或在线改谱。</p>
+        <p class="hint">GP5 是草稿而非成品谱：拍号由你指定（不做自动识别）、近似鼓记谱、启发式指法与自动和弦；建议在 Guitar Pro 或 TuxGuitar 中继续调整。reference.mid 保留首次转录结果，可用于对比编辑前后的差异；flags.json 记录人工检查标记。仅 MIDI 模式不会提供 GP5 或在线改谱。</p>
       </div>
 
       <div id="stemPlayers" class="stem-players"></div>
@@ -360,7 +387,7 @@
         </div>
         <div>
           <h3>边界</h3>
-          <p>不接入 LLM，不做云端推理，不抓取商业谱库。在线编辑器只支持改弦/品、删除音符和静音；不是完整的 Guitar Pro 替代品。</p>
+          <p>不接入 LLM，不做云端推理，不抓取商业谱库。在线编辑器支持改弦/品、删除音符、整轨移调、静音/试听 solo、一步撤销和人工检查标记；不是完整的 Guitar Pro 替代品。</p>
         </div>
         <div>
           <h3>结果状态</h3>

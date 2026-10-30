@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from . import pipeline, score_ir
+from . import midi_in, pipeline, score_ir
 from .config import (
     BASS_TUNINGS,
     GUITAR_TUNINGS,
@@ -29,7 +29,9 @@ from .config import (
     TIME_SIGNATURE_CHOICES,
     TIME_SIGNATURE_LABELS,
     Options,
+    loopback_host_error,
 )
+from .midifile import midi_duration
 from .utils import (
     ensure_dir,
     ffprobe_duration,
@@ -37,6 +39,7 @@ from .utils import (
     read_json,
     slugify,
     write_json,
+    zip_directory,
 )
 
 logger = logging.getLogger("audio2gp.api")
@@ -52,6 +55,8 @@ ALLOWED_AUDIO_EXTENSIONS = {
     ".oga",
     ".aif",
     ".aiff",
+    ".mid",
+    ".midi",
 }
 STAGE_LABELS = {
     "queued": "排队中",
@@ -65,7 +70,6 @@ STAGE_LABELS = {
     "done": "完成",
     "error": "失败",
 }
-LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
 class JobOptions(BaseModel):
@@ -74,6 +78,7 @@ class JobOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     demucs_model: Literal["htdemucs_ft", "htdemucs"] = "htdemucs_ft"
+    transcription_engine: Literal["basic_pitch", "external"] = "basic_pitch"
     quantize: int = 16
     guitar_stem: Literal["other", "vocals"] = "other"
     keep_stems: bool = True
@@ -118,6 +123,26 @@ class MuteEdit(BaseModel):
     muted: bool
 
 
+class UndoEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int = Field(ge=0)
+
+
+class TransposeEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    revision: int = Field(ge=0)
+    semitones: int = Field(ge=-24, le=24)
+
+
+class FlagEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    flagged: bool
+    reason: str | None = Field(default=None, max_length=200)
+
+
 @dataclass
 class JobRecord:
     id: str
@@ -146,8 +171,9 @@ class JobRecord:
 class JobManager:
     """Single-process job registry with a one-worker GPU-friendly executor.
 
-    Jobs live in memory; their output directories remain on disk. This is
-    deliberately a localhost application, not a multi-user service.
+    Active jobs live in memory; completed output directories are re-registered
+    from meta.json on startup. This is deliberately a localhost application,
+    not a multi-user service.
     """
 
     def __init__(
@@ -167,6 +193,46 @@ class JobManager:
         self.jobs: dict[str, JobRecord] = {}
         self.lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audio2gp-job")
+        self._restore_jobs()
+
+    def _restore_jobs(self) -> None:
+        """Re-register completed jobs so ?job= links survive a server restart."""
+        try:
+            out_dirs = sorted(
+                (path for path in self.output_root.iterdir() if path.is_dir()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )[:200]
+        except OSError:
+            return
+        for out_dir in out_dirs:
+            if not (out_dir / "meta.json").is_file():
+                continue  # interrupted job, never finished writing metadata
+            try:
+                meta = read_json(out_dir / "meta.json")
+                if not isinstance(meta, dict) or meta.get("status") not in {"ok", "partial"}:
+                    continue
+                info = meta.get("input") or {}
+                record = JobRecord(
+                    id=out_dir.name,
+                    original_name=str(info.get("name") or out_dir.name),
+                    input_path=self.work_root / out_dir.name / "input",
+                    work_dir=self.work_root / out_dir.name,
+                    out_dir=out_dir,
+                    status="done",
+                    stage="done",
+                    progress=100.0,
+                    message="完成（已从磁盘恢复）",
+                    created=str(meta.get("created") or ""),
+                    finished=str(meta.get("created") or ""),
+                    partial=meta.get("status") == "partial",
+                    warnings=list(meta.get("warnings") or []),
+                )
+                record.result = self._build_result(record)
+                self.jobs[record.id] = record
+            except Exception as exc:
+                # A corrupt or half-written output directory must not block startup.
+                logger.warning("could not restore job from %s: %s", out_dir, exc)
 
     def allocate(self, original_name: str) -> JobRecord:
         original = Path(original_name or "audio").name
@@ -308,6 +374,10 @@ class JobManager:
             files["tracks"] = url("tracks.json")
         if (record.out_dir / "chords.json").is_file():
             files["chords"] = url("chords.json")
+        if (record.out_dir / score_ir.FLAGS_FILE).is_file():
+            files["flags"] = url(score_ir.FLAGS_FILE)
+        if (record.out_dir / "midi" / "reference.mid").is_file():
+            files["reference_midi"] = url("midi/reference.mid")
         if (record.out_dir / "midi" / "full.mid").is_file():
             files["full_midi"] = url("midi/full.mid")
         midi_names = []
@@ -397,6 +467,7 @@ class JobManager:
             or meta.get("bar_ticks")
             or 3840
         )
+        flags = score_ir.load_flags(record.out_dir, state) if state is not None else []
         return {
             "status": result_status,
             "output_format": output_format,
@@ -423,10 +494,14 @@ class JobManager:
             "state_url": f"/api/jobs/{record.id}/state" if state is not None else None,
             "score_url": score_url,
             "can_edit": state is not None,
+            "can_undo": (record.out_dir / score_ir.PREVIOUS_STATE).is_file(),
+            "flags": flags,
+            "flag_count": len(flags),
+            "input_kind": str(meta.get("input_kind") or "audio"),
             "rhythm": meta.get("rhythm") or {},
         }
 
-    def refresh_after_edit(self, record: JobRecord) -> dict:
+    def refresh_after_edit(self, record: JobRecord, message: str = "已更新乐谱") -> dict:
         result = self._build_result(record)
         with self.lock:
             record.result = result
@@ -435,7 +510,7 @@ class JobManager:
             record.status = "done"
             record.stage = "done"
             record.progress = 100.0
-            record.message = "已更新乐谱" if not record.partial else "已更新（GP5 部分失败）"
+            record.message = message if not record.partial else f"{message}（GP5 部分失败）"
         return result
 
     def public(self, record: JobRecord) -> dict:
@@ -507,7 +582,8 @@ def _safe_output_file(record: JobRecord, relative: str) -> Path:
         raise HTTPException(status_code=404, detail="文件不存在") from exc
     parts = resolved_relative.split("/")
     allowed = (
-        resolved_relative in {"song.gp5", "meta.json", "tracks.json", "chords.json"}
+        resolved_relative
+        in {"song.gp5", "meta.json", "tracks.json", "chords.json", score_ir.FLAGS_FILE}
         or (parts[0] in {"midi", "stems"} and len(parts) == 2)
         or (
             len(parts) == 1
@@ -528,6 +604,28 @@ def _media_type(path: Path) -> str:
         ".zip": "application/zip",
         ".json": "application/json",
     }.get(path.suffix.lower(), "application/octet-stream")
+
+
+def _refresh_flag_artifacts(record: JobRecord, flag_count: int) -> str | None:
+    """Keep meta.json and the ZIP in sync with flags.json."""
+    meta_path = record.out_dir / "meta.json"
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = read_json(meta_path)
+        if not isinstance(meta, dict):
+            meta = {}
+        files = dict(meta.get("files") or {})
+        files["flags"] = score_ir.FLAGS_FILE
+        files.setdefault("zip", f"audio2gp_{record.id}.zip")
+        meta["files"] = files
+        meta["flag_count"] = int(flag_count)
+        write_json(meta_path, meta)
+        zip_directory(record.out_dir, record.out_dir / str(files["zip"]))
+    except Exception as exc:
+        logger.exception("job %s: could not refresh the flag artifacts", record.id)
+        return f"问题标记已保存，但 meta/ZIP 刷新失败：{exc}"
+    return None
 
 
 def create_app(
@@ -592,14 +690,18 @@ def create_app(
             "bass_tunings": BASS_TUNINGS,
             "stems": list(STEM_NAMES),
             "output_formats": ["gp5_midi", "midi_only"],
+            "transcription_engines": ["basic_pitch", "external"],
+            "external_engine_configured": bool(
+                os.environ.get("AUDIO2GP_EXTERNAL_CMD", "").strip()
+            ),
             "chord_analysis": True,
             "time_signatures": [
                 {"value": value, "label": TIME_SIGNATURE_LABELS[value]}
                 for value in TIME_SIGNATURE_CHOICES
             ],
             "manual_downbeat": True,
-            # The automatic downbeat detector is deliberately 4/4-only.
-            "auto_downbeat_time_signatures": ["4/4"],
+            # madmom handles 4/4; other signatures use the librosa path.
+            "auto_downbeat_time_signatures": list(TIME_SIGNATURE_CHOICES),
         }
 
     @app.post("/api/jobs", status_code=202)
@@ -613,19 +715,26 @@ def create_app(
         if extension not in ALLOWED_AUDIO_EXTENSIONS:
             raise HTTPException(
                 status_code=422,
-                detail="支持的音频格式：" + ", ".join(sorted(ALLOWED_AUDIO_EXTENSIONS)),
+                detail="支持的格式：" + ", ".join(sorted(ALLOWED_AUDIO_EXTENSIONS)),
             )
         record = manager.allocate(original)
+        is_midi = extension in midi_in.MIDI_EXTENSIONS
         try:
             await _save_upload(file, record.input_path, manager.max_upload_bytes)
             try:
-                duration = await asyncio.to_thread(ffprobe_duration, record.input_path)
+                duration = await asyncio.to_thread(
+                    midi_duration if is_midi else ffprobe_duration,
+                    record.input_path,
+                )
             except Exception as exc:
-                raise HTTPException(status_code=422, detail=f"无法读取音频：{exc}") from exc
+                kind = "MIDI" if is_midi else "音频"
+                raise HTTPException(
+                    status_code=422, detail=f"无法读取{kind}：{exc}"
+                ) from exc
             if duration > manager.max_duration_s:
                 raise HTTPException(
                     status_code=413,
-                    detail=f"音频时长 {duration:.1f}s 超过 {manager.max_duration_s:.0f}s 上限",
+                    detail=f"输入时长 {duration:.1f}s 超过 {manager.max_duration_s:.0f}s 上限",
                 )
             manager.submit(record, parsed)
         except Exception:
@@ -706,18 +815,7 @@ def create_app(
             )
         return state
 
-    def _commit_edit(record: JobRecord, state: dict, changed: int) -> dict:
-        try:
-            committed = score_ir.commit_state(
-                state,
-                record.out_dir,
-                logger=logging.getLogger(f"audio2gp.edit.{record.id}"),
-            )
-        except score_ir.StateError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except Exception as exc:
-            logger.exception("job %s: score rebuild failed", record.id)
-            raise HTTPException(status_code=500, detail=f"重新生成 GP5 失败：{exc}") from exc
+    def _edit_response(record: JobRecord, committed: dict, changed: int) -> dict:
         result = manager.refresh_after_edit(record)
         new_state = committed["state"]
         return {
@@ -726,9 +824,32 @@ def create_app(
             "revision": int(new_state["revision"]),
             "changed": int(changed),
             "warnings": list(committed["warnings"]),
+            "flags": result.get("flags") or [],
+            "can_undo": bool(result.get("can_undo")),
             "gp5_url": result.get("score_url"),
             "files": result.get("files"),
         }
+
+    def _commit_edit(
+        record: JobRecord,
+        state: dict,
+        changed: int,
+        *,
+        snapshot_previous: bool = True,
+    ) -> dict:
+        try:
+            committed = score_ir.commit_state(
+                state,
+                record.out_dir,
+                logger=logging.getLogger(f"audio2gp.edit.{record.id}"),
+                snapshot_previous=snapshot_previous,
+            )
+        except score_ir.StateError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("job %s: score rebuild failed", record.id)
+            raise HTTPException(status_code=500, detail=f"重新生成 GP5 失败：{exc}") from exc
+        return _edit_response(record, committed, changed)
 
     @app.patch("/api/jobs/{job_id}/tracks/{track_id}/notes/{note_id}")
     def edit_note(
@@ -782,6 +903,76 @@ def create_app(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             return _commit_edit(record, state, int(bool(edited["muted"])))
 
+    @app.post("/api/jobs/{job_id}/tracks/{track_id}/transpose")
+    def transpose_track(job_id: str, track_id: str, payload: TransposeEdit) -> dict:
+        record = manager.get(job_id)
+        with record.edit_lock:
+            state = _edit_context(record, payload.revision)
+            try:
+                edited = score_ir.transpose_track(
+                    state, track_id, int(payload.semitones)
+                )
+            except score_ir.StateError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            response = _commit_edit(record, state, int(edited["changed"]))
+            response["warnings"] = list(response["warnings"]) + list(edited["warnings"])
+            response["dropped"] = int(edited["dropped"])
+            return response
+
+    @app.post("/api/jobs/{job_id}/undo")
+    def undo_edit(job_id: str, payload: UndoEdit) -> dict:
+        record = manager.get(job_id)
+        with record.edit_lock:
+            state = _edit_context(record, payload.revision)
+            try:
+                committed = score_ir.undo_last_edit(
+                    state,
+                    record.out_dir,
+                    logger=logging.getLogger(f"audio2gp.undo.{record.id}"),
+                )
+            except score_ir.StateError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            except Exception as exc:
+                logger.exception("job %s: undo failed", record.id)
+                raise HTTPException(status_code=500, detail=f"撤销失败：{exc}") from exc
+            return _edit_response(record, committed, 1)
+
+    @app.put("/api/jobs/{job_id}/tracks/{track_id}/notes/{note_id}/flag")
+    def flag_note(
+        job_id: str,
+        track_id: str,
+        note_id: str,
+        payload: FlagEdit,
+    ) -> dict:
+        record = manager.get(job_id)
+        with record.edit_lock:
+            if not record.state_path.is_file():
+                raise HTTPException(status_code=409, detail="该任务尚无可编辑的乐谱")
+            try:
+                state = score_ir.load_state(record.state_path)
+            except score_ir.StateError as exc:
+                raise HTTPException(status_code=500, detail=f"乐谱状态损坏：{exc}") from exc
+            try:
+                edited = score_ir.set_note_flag(
+                    state,
+                    record.out_dir,
+                    track_id,
+                    note_id,
+                    flagged=bool(payload.flagged),
+                    reason=payload.reason,
+                )
+            except score_ir.StateError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            warning = _refresh_flag_artifacts(record, len(edited["flags"]))
+            result = manager.refresh_after_edit(record, "已更新问题标记")
+            return {
+                "job": manager.public(record),
+                "flags": edited["flags"],
+                "flag_count": len(edited["flags"]),
+                "files": result.get("files"),
+                "warning": warning,
+            }
+
     return app
 
 
@@ -812,11 +1003,9 @@ def main(argv: list[str] | None = None) -> int:
         default=float(os.environ.get("AUDIO2GP_MAX_DURATION_S", "600")),
     )
     args = parser.parse_args(argv)
-    if args.host not in LOOPBACK_HOSTS:
-        print(
-            f"Refusing to bind {args.host!r}: audio2gp is localhost-only. "
-            "Use 127.0.0.1."
-        )
+    error = loopback_host_error(args.host)
+    if error:
+        print(error)
         return 2
     app = create_app(
         args.output_dir,

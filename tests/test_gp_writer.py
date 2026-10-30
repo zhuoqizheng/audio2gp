@@ -133,6 +133,49 @@ def test_onset_chord_duration_and_rests(tmp_path: Path) -> None:
     assert beats[1].notes[0].value == 8
 
 
+def test_onset_layout_splits_a_gap_that_is_not_a_single_note(tmp_path: Path) -> None:
+    # Tick 0 to 1320 is legal on the 1/32 grid but 1320 is not one note value;
+    # the old code wrote 1280 and left an unwritable 40-tick rest.
+    guitar = _guitar(
+        [
+            _fnote(0, 480, 64, 1, 0),
+            _fnote(1320, 1800, 67, 3, 3),
+        ]
+    )
+    path = tmp_path / "gap.gp5"
+    write_gp5(
+        [guitar], bpm=120.0, measure_count=1, path=path, layout="onset", quantize=32
+    )
+    assert verify_gp5(path, expected_measures=1, expected_tracks=1) == []
+    song = gp.parse(str(path))
+    beats = song.tracks[0].measures[0].voices[0].beats
+    assert sum(beat.duration.time for beat in beats) == TICKS_PER_BAR
+
+
+def test_drum_hit_is_clamped_to_the_9_8_bar_line(tmp_path: Path) -> None:
+    # 9/8 is 4320 ticks; on the 1/8-triplet grid (320) the last hit starts at
+    # 4160 and must not spill 160 ticks past the bar line.
+    path = tmp_path / "drums_9_8.gp5"
+    write_gp5(
+        [_drums([Note(4160, 4480, 36, 100, "drums")])],
+        bpm=120.0,
+        measure_count=1,
+        path=path,
+        layout="onset",
+        quantize=12,
+        time_signature="9/8",
+    )
+    assert (
+        verify_gp5(
+            path, expected_measures=1, expected_tracks=1, time_signature="9/8"
+        )
+        == []
+    )
+    song = gp.parse(str(path))
+    beats = song.tracks[0].measures[0].voices[0].beats
+    assert sum(beat.duration.time for beat in beats) == 4320
+
+
 def test_empty_track_filled_with_eight_measures_of_rests(tmp_path: Path) -> None:
     path = tmp_path / "empty.gp5"
     write_gp5([_guitar()], bpm=90.0, measure_count=8, path=path, layout="ties")

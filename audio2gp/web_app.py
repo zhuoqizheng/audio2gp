@@ -17,6 +17,7 @@ from .config import (  # noqa: E402
     TIME_SIGNATURE_CHOICES,
     TIME_SIGNATURE_LABELS,
     Options,
+    loopback_host_error,
 )
 from .pipeline import PipelineError, run  # noqa: E402
 
@@ -53,14 +54,14 @@ INITIAL_LOG = (
     "等待任务。\n"
     "所有处理都在本机完成；首次运行会加载（必要时下载）Demucs 与强拍模型权重。\n"
     "拍号由你选择（本工具不做自动拍号识别）；默认 4/4。\n"
-    "4/4 会自动按检测到的强拍对齐小节，其他拍号请填写手动强拍位置。\n"
+    "开启对齐后，4/4 用 madmom、其他拍号用 librosa 自动检测强拍；也可手动指定。\n"
 )
 
 HELP_MARKDOWN = """\
 ### 处理流程
 
 1. **预处理**：把上传文件统一为 44.1 kHz 立体声 WAV，并估计速度。
-2. **节奏与强拍**：拍号由你在参数中指定，不做自动拍号识别。选 4/4 且开启「按检测到的强拍对齐小节」时，在本机用 madmom 强拍模型检测拍点与小节起点；其他拍号不会自动检测，可填写手动强拍位置。
+2. **节奏与强拍**：拍号由你在参数中指定，不做自动拍号识别。开启「按检测到的强拍对齐小节」时，4/4 在本机用 madmom 强拍模型，其他拍号用 librosa 节拍 + 重音相位检测拍点与小节起点；也可以填写手动强拍位置覆盖自动结果。
 3. **Demucs 分轨**：在后台分离出人声、鼓、贝斯、吉他/其他四条源分轨；只有你勾选的分轨会继续转录和输出。
 4. **转录**：选中的旋律分轨用 Basic Pitch 转成音高；选中的鼓轨用频谱与起音启发式映射到 GM 鼓件。
 5. **量化与对齐**：把音符吸附到量化网格，并让第 1 小节第 1 拍落在检测到的强拍上。
@@ -80,7 +81,7 @@ HELP_MARKDOWN = """\
 - **拍号由用户指定**：可选 4/4、3/4、2/4、6/8、9/8、12/8。拍号决定小节长度、MIDI/GP5 的拍号标记和小节线位置；本工具不做自动拍号识别。
 - **BPM 一律按四分音符计算**（MIDI 标准）。6/8、9/8、12/8 的一小节分别是 2、3、4 个附点四分音符拍；实际听感仍是每小节 2/3/4 个大拍。
 - **shuffle 不是一种拍号**，而是一种演奏感觉。常见写法有两种：4/4 加摇摆八分（本工具可把量化网格设为「1/8 三连音」），或者直接记成 12/8（推荐，记谱更干净）。慢速布鲁斯也常用 12/8。
-- **自动强拍分析只支持 4/4**：这与 madmom 模型按四拍一小节解码有关。其他拍号若开启对齐，会给出警告并让第 1 小节从音频开头开始；请填写「手动强拍位置」。
+- **自动强拍分析是拍号感知的**：4/4 使用 madmom 强拍模型；3/4、2/4、6/8、9/8、12/8 使用 librosa 节拍跟踪，并按所选拍号的小节长度与低音重音选择强拍相位。检测仍可能出错，可用「手动强拍位置」覆盖。
 - **手动强拍位置**：填写音频中第一个强拍出现的时间（秒）。填写后不再运行自动强拍检测，适用于所有拍号。第一个强拍之前已有音符（弱起 / pickup）时，弱起保留在前置小节，第一个强拍作为第 2 小节（或更后）的第 1 拍。
 - 没有手动值且自动分析成功时：第一个检测到的强拍就是第 1 小节第 1 拍。
 - 自动分析失败或关闭对齐时：第 1 小节从音频开头开始，其它步骤照常进行。
@@ -158,11 +159,6 @@ def _summary(result) -> str:
         )
     elif not rhythm.get("enabled"):
         lines.append("**小节对齐**: 关闭，第 1 小节从音频开头开始")
-    elif rhythm.get("mode") == "unsupported-meter":
-        lines.append(
-            f"**小节对齐**: 自动分析仅支持 4/4，{signature} 从音频开头开始；"
-            "可在「手动强拍位置（秒）」填写第 1 小节第 1 拍"
-        )
     elif rhythm.get("first_downbeat_s") is None:
         lines.append("**小节对齐**: 未检测到强拍，第 1 小节从音频开头开始")
     else:
@@ -206,6 +202,7 @@ def _run_job(
     selected_stems: list[str] | tuple[str, ...] | None,
     time_signature: str = "4/4",
     manual_downbeat: float = 0.0,
+    engine: str = "basic_pitch",
     progress: gr.Progress = gr.Progress(),
 ):
     """Generator handler.
@@ -245,12 +242,14 @@ def _run_job(
         yield emit_state()
         return
 
+    worker_started = False
     try:
         try:
             options = Options(
                 output_dir=OUTPUT_ROOT,
                 work_dir=WORK_ROOT,
                 demucs_model=str(model),
+                transcription_engine=str(engine or "basic_pitch"),
                 quantize=int(quantize),
                 guitar_stem=str(guitar_stem),
                 keep_stems=bool(keep_stems),
@@ -289,9 +288,14 @@ def _run_job(
                 q.put(("done", result))
             except BaseException as exc:  # noqa: BLE001 - conveyed to the handler thread
                 q.put(("error", exc))
+            finally:
+                # The worker owns the lock: a disconnected browser closes this
+                # generator while the job keeps running.
+                JOB_LOCK.release()
 
         thread = threading.Thread(target=worker, name="audio2gp-job", daemon=True)
         thread.start()
+        worker_started = True
         log_lines.append("任务已启动。")
         yield emit_state()
 
@@ -347,8 +351,6 @@ def _run_job(
                     alignment = f"手动强拍 {float(rhythm['first_downbeat_s']):.2f}s"
                 elif not rhythm.get("enabled"):
                     alignment = "关闭（第 1 小节从音频开头开始）"
-                elif rhythm.get("mode") == "unsupported-meter":
-                    alignment = f"{signature} 未自动对齐（第 1 小节从音频开头开始）"
                 elif rhythm.get("first_downbeat_s") is None:
                     alignment = "未检测到强拍"
                 else:
@@ -382,7 +384,8 @@ def _run_job(
             yield emit_state()
             return
     finally:
-        JOB_LOCK.release()
+        if not worker_started:
+            JOB_LOCK.release()
 
 
 def _reset():
@@ -447,6 +450,23 @@ def build_demo() -> gr.Blocks:
                         "但耗时约为 `htdemucs` 的 4 倍；`htdemucs` 适合先快速试听。"
                         "**设备**：`auto` 自动使用可用的 CUDA；`cuda` 强制 GPU；"
                         "`cpu` 仅用于没有显卡或排查 CUDA 问题，速度很慢。",
+                        elem_classes=["small-note"],
+                    )
+                    engine = gr.Dropdown(
+                        choices=[
+                            ("Basic Pitch（内置，推荐）", "basic_pitch"),
+                            ("外部引擎（需配置 AUDIO2GP_EXTERNAL_CMD）", "external"),
+                        ],
+                        value="basic_pitch",
+                        label="旋律转录引擎",
+                        info="外部引擎逐声部运行本机命令并输出 MIDI；未配置或失败时自动回退 Basic Pitch。",
+                    )
+                    gr.Markdown(
+                        "**旋律转录引擎**：内置 `basic_pitch` 无需配置。`external` 使用环境变量 "
+                        "`AUDIO2GP_EXTERNAL_CMD` 指定的本机命令，每个声部调用一次，命令需通过 "
+                        "`{wav}`、`{stem}`、`{out}`、`{bpm}` 占位符接收路径并写出 MIDI。"
+                        "音频不会离开本机；命令未配置或失败时任务会回退 Basic Pitch 并在警告中说明。"
+                        "鼓轨始终使用内置识别。",
                         elem_classes=["small-note"],
                     )
                     selected_stems = gr.CheckboxGroup(
@@ -518,20 +538,20 @@ def build_demo() -> gr.Blocks:
                             value=0,
                             precision=1,
                             label="BPM 覆盖（0 = 自动估计）",
-                            info="自动 BPM 明显错误时填写实际值；只改速度和网格，不改强拍相位。",
+                            info="自动 BPM 明显错误时填写实际值（20–300）；只改速度和网格，不改强拍相位。",
                         )
                     gr.Markdown(
                         "**最大品格**：限制指法搜索范围。15 品覆盖大部分常用把位；"
                         "原曲有高把位独奏时可调到 19–24；调低可减少高把位结果。"
                         "**BPM 覆盖**：`0` 表示自动估计。自动 BPM 明显错误（例如把 80 听成 160）时，"
-                        "填写实际 BPM；它改变速度和小节长度，但不会移动第一个强拍的位置。",
+                        "填写实际 BPM（20–300）；它改变速度和小节长度，但不会移动第一个强拍的位置。",
                         elem_classes=["small-note"],
                     )
                     with gr.Row():
                         align_downbeats = gr.Checkbox(
                             value=True,
-                            label="按检测到的强拍对齐小节（自动分析仅 4/4）",
-                            info="让第 1 小节第 1 拍落在强拍；其他拍号请填手动强拍位置。",
+                            label="按检测到的强拍对齐小节",
+                            info="4/4 用 madmom，其他拍号用 librosa；手动强拍位置优先。",
                         )
                         keep_stems = gr.Checkbox(
                             value=True,
@@ -544,9 +564,9 @@ def build_demo() -> gr.Blocks:
                             info="额外写入人声音高旋律，不包含歌词。",
                         )
                     gr.Markdown(
-                        "**按检测到的强拍对齐小节**：在本机用 madmom 模型检测强拍，"
-                        "让小节线落在重拍上。自动强拍分析目前只支持 4/4；其他拍号会给出警告，"
-                        "并让第 1 小节从音频开头开始，除非填写了手动强拍位置。"
+                        "**按检测到的强拍对齐小节**：在本机检测强拍并让小节线落在重拍上。"
+                        "4/4 使用 madmom 强拍模型；3/4、2/4、6/8、9/8、12/8 使用 librosa 节拍跟踪"
+                        "与低音重音相位。检测不理想时可填写手动强拍位置覆盖。"
                         "没有弱起时第一个强拍是第 1 小节第 1 拍；"
                         "有弱起时弱起保留在前置小节，第一个强拍从第 2 小节（或更后）开始。"
                         "模型不可用时自动回退到 librosa 重音估计。"
@@ -597,7 +617,7 @@ def build_demo() -> gr.Blocks:
                 summary = gr.Markdown(INITIAL_SUMMARY)
                 gr.Markdown(
                     "**说明**：输出使用你选择的拍号；自动拍号识别不在本工具范围内。"
-                    "4/4 会自动按检测到的强拍对齐小节，其他拍号可填写手动强拍位置。"
+                    "开启对齐后会按所选拍号自动检测强拍；检测不理想时可填写手动强拍位置。"
                     "开头有弱起时会保留为前置小节。BPM 为估计值，调式默认 C 大调。"
                     "指法与鼓点为算法近似，建议用 Guitar Pro / TuxGuitar 打开后编辑。"
                 )
@@ -628,6 +648,7 @@ def build_demo() -> gr.Blocks:
                 selected_stems,
                 time_signature,
                 manual_downbeat,
+                engine,
             ],
             outputs=outputs,
             api_name="convert",
@@ -646,9 +667,15 @@ def build_demo() -> gr.Blocks:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="audio2gp Gradio web UI")
-    parser.add_argument("--host", default="127.0.0.1", help="bind address (default: local only)")
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="loopback bind address (default: 127.0.0.1)"
+    )
     parser.add_argument("--port", type=int, default=7860, help="port (default: 7860)")
     args = parser.parse_args(argv)
+    error = loopback_host_error(args.host)
+    if error:
+        print(error)
+        return 2
 
     demo = build_demo()
     demo.queue(default_concurrency_limit=1, max_size=8)

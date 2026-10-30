@@ -17,6 +17,8 @@ from .utils import read_json, safe_ascii, slugify, write_json, zip_directory
 
 FORMAT = 1
 STEMS = ("vocals", "drums", "bass", "other")
+FLAGS_FILE = "flags.json"
+PREVIOUS_STATE = ".previous-tracks.json"
 
 
 class StateError(ValueError):
@@ -345,6 +347,178 @@ def set_track_muted(state: dict, track_id: str, muted: bool) -> dict:
     return {"track": track_id, "muted": bool(muted)}
 
 
+def transpose_track(
+    state: dict,
+    track_id: str,
+    semitones: int,
+) -> dict:
+    """Shift a melodic track by semitones and re-finger it in place.
+
+    Each note keeps its id, timing, and velocity. The same string is preferred
+    when the fret stays legal; otherwise the nearest playable string/fret wins.
+    Notes that no longer fit are dropped and reported.
+    """
+    track = get_track(state, track_id)
+    if track.get("is_percussion"):
+        raise StateError("drum tracks cannot be transposed")
+    semitones = int(semitones)
+    if semitones == 0:
+        raise StateError("semitones must not be zero")
+    if not -24 <= semitones <= 24:
+        raise StateError("semitones must be between -24 and 24")
+    tuning = [int(value) for value in track.get("tuning") or []]
+    max_fret = int(state.get("max_fret", 24))
+    notes = [dict(note) for note in track.get("notes") or []]
+    by_onset: dict[int, list[dict]] = {}
+    for note in notes:
+        by_onset.setdefault(int(note["start_tick"]), []).append(note)
+    occupied: set[tuple[int, int]] = set()
+    for start_tick, group in by_onset.items():
+        options: list[tuple[dict, list[tuple[int, int, int]]]] = []
+        for note in group:
+            target = int(note["pitch"]) + semitones
+            old_string = int(note["string"])
+            old_fret = int(note["fret"])
+            candidates = sorted(
+                (
+                    abs(string - old_string) * 2
+                    + abs(target - open_pitch - old_fret),
+                    string,
+                    target - open_pitch,
+                )
+                for string, open_pitch in enumerate(tuning, start=1)
+                if 0 <= target <= 127
+                and 0 <= target - open_pitch <= max_fret
+            )
+            options.append((note, candidates))
+        # Most constrained notes first: a note with one legal position must
+        # not lose it to a note that could have moved elsewhere.
+        for note, candidates in sorted(options, key=lambda item: len(item[1])):
+            target = int(note["pitch"]) + semitones
+            chosen = next(
+                (
+                    (string, fret)
+                    for _cost, string, fret in candidates
+                    if (start_tick, string) not in occupied
+                ),
+                None,
+            )
+            if chosen is None:
+                note["_drop"] = True
+                continue
+            string, fret = chosen
+            note["string"] = string
+            note["fret"] = fret
+            note["pitch"] = target
+            note["hammer"] = False
+            note["slide"] = 0
+            occupied.add((start_tick, string))
+
+    kept = [note for note in notes if not note.get("_drop")]
+    dropped = len(notes) - len(kept)
+    if notes and not kept:
+        raise StateError("transposition leaves no playable notes; try another interval")
+    for note in kept:
+        note.pop("_drop", None)
+    track["notes"] = kept
+    validate_state(state)
+    warnings = []
+    if dropped:
+        warnings.append(
+            f"{dropped} note(s) could not be placed after transposing; dropped"
+        )
+    return {
+        "track": track_id,
+        "semitones": semitones,
+        "changed": len(kept),
+        "dropped": dropped,
+        "warnings": warnings,
+    }
+
+
+def _flags_path(out_dir: Path | str) -> Path:
+    return Path(out_dir) / FLAGS_FILE
+
+
+def _read_flag_doc(path: Path) -> list[dict]:
+    try:
+        doc = read_json(path)
+    except Exception:
+        return []
+    entries = doc.get("flags") if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def load_flags(out_dir: Path | str, state: dict) -> list[dict]:
+    """Return saved flags that still point at an existing note."""
+    flags: list[dict] = []
+    bar_ticks = int(state.get("bar_ticks") or 3840)
+    for entry in _read_flag_doc(_flags_path(out_dir)):
+        track_id = str(entry.get("track_id") or "")
+        note_id = str(entry.get("note_id") or "")
+        try:
+            track = get_track(state, track_id)
+            note = get_note(track, note_id)
+        except StateError:
+            continue
+        flags.append(
+            {
+                "track_id": track_id,
+                "track_name": str(track.get("name") or track_id),
+                "note_id": note_id,
+                "pitch": int(note["pitch"]),
+                "start_tick": int(note["start_tick"]),
+                "bar": int(note["start_tick"]) // bar_ticks + 1,
+                "reason": str(entry.get("reason") or "需要人工检查"),
+                "created": str(entry.get("created") or ""),
+            }
+        )
+    return sorted(flags, key=lambda item: (item["start_tick"], item["track_id"]))
+
+
+def set_note_flag(
+    state: dict,
+    out_dir: Path | str,
+    track_id: str,
+    note_id: str,
+    *,
+    flagged: bool,
+    reason: str | None = None,
+) -> dict:
+    """Add or remove a review flag. Flags are metadata and never bump the revision."""
+    validate_state(state)
+    track = get_track(state, track_id)
+    note = get_note(track, note_id)
+    path = _flags_path(out_dir)
+    entries = [
+        entry
+        for entry in _read_flag_doc(path)
+        if not (
+            str(entry.get("track_id")) == str(track_id)
+            and str(entry.get("note_id")) == str(note_id)
+        )
+    ]
+    if flagged:
+        text = str(reason or "").strip()[:200] or "需要人工检查"
+        entries.append(
+            {
+                "track_id": str(track_id),
+                "note_id": str(note_id),
+                "reason": text,
+                "created": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    write_json(path, {"version": 1, "flags": entries})
+    return {
+        "track": track_id,
+        "note_id": note_id,
+        "flagged": bool(flagged),
+        "flags": load_flags(out_dir, state),
+    }
+
+
 def ir_to_chords(state: dict) -> list[ChordEvent]:
     validate_state(state)
     return chords_from_state(state.get("chords") or [])
@@ -408,8 +582,13 @@ def commit_state(
     out_dir: Path | str,
     *,
     logger: logging.Logger | None = None,
+    snapshot_previous: bool = True,
 ) -> dict:
-    """Regenerate GP5/MIDI from the IR and atomically publish the new revision."""
+    """Regenerate GP5/MIDI from the IR and atomically publish the new revision.
+
+    ``snapshot_previous`` keeps the last on-disk state as a one-step undo
+    target. Undo itself commits with it disabled.
+    """
     validate_state(state)
     out_dir = Path(out_dir)
     tracks = ir_to_tracks(state)
@@ -465,6 +644,17 @@ def commit_state(
         new_state["revision"] = int(state.get("revision", 0)) + 1
         new_state["edited_at"] = datetime.now(timezone.utc).isoformat()
         state_path = out_dir / "tracks.json"
+        if snapshot_previous and state_path.is_file():
+            previous_path = out_dir / PREVIOUS_STATE
+            try:
+                previous = read_json(state_path)
+                validate_state(previous)
+                temp_previous = previous_path.with_suffix(".tmp")
+                write_json(temp_previous, previous)
+                os.replace(temp_previous, previous_path)
+            except Exception:
+                if logger:
+                    logger.warning("could not snapshot the previous state", exc_info=True)
         write_json(state_path, new_state)
         meta = _update_meta(
             out_dir,
@@ -495,6 +685,32 @@ def commit_state(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def undo_last_edit(
+    state: dict,
+    out_dir: Path | str,
+    *,
+    logger: logging.Logger | None = None,
+) -> dict:
+    """Restore the state saved before the most recent commit (one step)."""
+    validate_state(state)
+    out_dir = Path(out_dir)
+    previous_path = out_dir / PREVIOUS_STATE
+    if not previous_path.is_file():
+        raise StateError("没有可撤销的修改")
+    previous = read_json(previous_path)
+    validate_state(previous)
+    previous["revision"] = int(state.get("revision", 0))
+    previous.pop("edited_at", None)
+    committed = commit_state(
+        previous,
+        out_dir,
+        logger=logger,
+        snapshot_previous=False,
+    )
+    previous_path.unlink(missing_ok=True)
+    return committed
+
+
 def _update_meta(
     out_dir: Path,
     state: dict,
@@ -518,6 +734,8 @@ def _update_meta(
     }
     if (out_dir / "chords.json").is_file():
         files["chords"] = "chords.json"
+    if (out_dir / FLAGS_FILE).is_file():
+        files["flags"] = FLAGS_FILE
     files.setdefault("meta", "meta.json")
     files.setdefault(
         "zip", f"audio2gp_{state.get('job_id', 'job')}.zip"

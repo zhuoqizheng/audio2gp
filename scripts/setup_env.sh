@@ -39,11 +39,12 @@ rm -f "$PTH"
 
 # Demucs and its runtime deps without dependency resolution. In particular,
 # julius declares torch>=1.13, so a normal install would download a second
-# (CUDA 13) torch before the user-site .pth exists. Their non-torch deps
-# (huggingface-hub, numpy, etc.) were already installed with requirements.txt.
+# (CUDA 13) torch before the user-site .pth exists. Versions come from
+# constraints.txt; huggingface-hub is explicit so Demucs does not rely on
+# Gradio's dependency tree.
 "$VENV_PY" -m pip install --no-deps 'demucs==4.1.0'
-"$VENV_PY" -m pip install --no-deps \
-    einops 'julius>=0.2.3' 'lameenc>=1.2' pyyaml safetensors \
+"$VENV_PY" -m pip install --no-deps -c constraints.txt \
+    einops huggingface-hub 'julius>=0.2.3' 'lameenc>=1.2' pyyaml safetensors \
     'sphn>=0.1.12' tqdm
 
 "$VENV_PY" -m pip install -e . --no-deps

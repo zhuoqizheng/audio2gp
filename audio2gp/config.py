@@ -4,6 +4,16 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def loopback_host_error(host: str) -> str | None:
+    """Return a refusal message unless host is a loopback address."""
+    if host in LOOPBACK_HOSTS:
+        return None
+    return f"Refusing to bind {host!r}: audio2gp is localhost-only. Use 127.0.0.1."
+
+
 # General MIDI programs used by the generated files.
 PROGRAMS = {
     "guitar": 27,       # Electric Guitar (clean)
@@ -212,6 +222,9 @@ class Options:
     output_dir: Path = Path("output")
     work_dir: Path = Path("work")
     demucs_model: str = "htdemucs_ft"
+    # basic_pitch = built-in TFLite model; external = command in
+    # AUDIO2GP_EXTERNAL_CMD (see audio2gp.engines).
+    transcription_engine: str = "basic_pitch"
     quantize: int = 16
     guitar_stem: str = "other"
     keep_stems: bool = True
@@ -226,8 +239,9 @@ class Options:
     # Optional manual first downbeat in source-audio seconds. When set it
     # replaces automatic downbeat analysis and works with any meter.
     manual_downbeat_s: float | None = None
-    # Automatic downbeat analysis is implemented for 4/4 only. Non-4/4 output
-    # starts at the audio origin unless manual_downbeat_s is supplied.
+    # Automatic downbeat analysis is meter-aware: madmom for 4/4, librosa
+    # accent phase for the other user-selected signatures. A manual downbeat
+    # always wins over the automatic result.
     align_downbeats: bool = True
     guitar_tuning: str = "standard"
     bass_tuning: str = "standard"
@@ -302,6 +316,8 @@ class Options:
     def validate(self) -> None:
         if self.quantize not in QUANTIZE_VALUES:
             raise ValueError(f"quantize must be one of {QUANTIZE_VALUES}")
+        if self.bpm_override is not None and not 20 <= float(self.bpm_override) <= 300:
+            raise ValueError("bpm_override must be between 20 and 300")
         if self.guitar_stem not in {"other", "vocals"}:
             raise ValueError("guitar_stem must be 'other' or 'vocals'")
         if not 0 <= int(self.max_fret) <= 24:
@@ -330,6 +346,8 @@ class Options:
             raise ValueError("device must be auto, cuda, or cpu")
         if self.demucs_model not in {"htdemucs_ft", "htdemucs"}:
             raise ValueError("demucs_model must be htdemucs_ft or htdemucs")
+        if self.transcription_engine not in {"basic_pitch", "external"}:
+            raise ValueError("transcription_engine must be basic_pitch or external")
         if not self.selected_stems:
             raise ValueError(
                 "select at least one stem: " + ", ".join(STEM_NAMES)

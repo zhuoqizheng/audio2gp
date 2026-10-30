@@ -169,7 +169,10 @@ def zip_directory(directory: Path, zip_path: Path) -> Path:
         for path in sorted(directory.rglob("*")):
             if not path.is_file() or path.resolve() == zip_path.resolve():
                 continue
-            zf.write(path, path.relative_to(directory).as_posix())
+            relative = path.relative_to(directory)
+            if any(part.startswith(".") for part in relative.parts):
+                continue  # undo snapshots and temp files stay out of the ZIP
+            zf.write(path, relative.as_posix())
     return zip_path
 
 

@@ -43,7 +43,7 @@
 - 云端账号、公共部署、多用户鉴权；
 - 抓取或分发商业吉他谱；
 - 内嵌 Guitar Pro；
-- 完整 DAW/制谱器、撤销栈、多轨自动重排、PWA、移动端专门适配；
+- 完整 DAW/制谱器、多步撤销、多轨自动重排、PWA、移动端专门适配；
 - 自动拍号识别、曲中变拍号、变速曲/速度图、雕琢级表情记号；
 - 复音音乐理论级纠错。
 
@@ -57,7 +57,7 @@ Guitar Pro 本身也不内嵌：网页使用 MPL-2.0 的 alphaTab 阅读/播放 
 
 | TabForge 的做法 | audio2gp 的落地 | 差异/简化 |
 |---|---|---|
-| Demucs → Basic Pitch → librosa → 指法 → GP5 的本地管线 | 相同的主干；FastAPI + 静态前端 + alphaTab | 本项目的模型栈固定为 Demucs 4.1 + Basic Pitch；不接其他转录引擎 |
+| Demucs → Basic Pitch → librosa → 指法 → GP5 的本地管线 | 相同的主干；FastAPI + 静态前端 + alphaTab | 内置模型栈为 Demucs 4.1 + Basic Pitch；可选外部命令引擎，鼓轨仍用内置启发式 |
 | 鼓轨优先的全局速度、半/倍速消歧、120 BPM 回退 | `rhythm.refine_tempo_from_drums`：鼓点中位拍间隔；2:1/1:2/3:2 等候选按 log 距离贴近参考速度；4% 内保留小节网格速度；失败保留混音/强拍速度 | 未做 TabForge 的完整置信度评估；静音/异常时保留参考值并警告 |
 | 先聚类起音再吸附网格，避免和弦被拆散 | `midi_post._cluster` 在 35 ms 窗口内聚类，用簇平均起音量化 | 固定窗口；鼓点单独按 `(tick, pitch)` 去重 |
 | 鬼音/短音/复音清理 | Basic Pitch 幅度门限 + 短音 0.15 s 联合过滤；`min_note_sec`；每起音最多 `max_polyphony` 个同时音；贝斯/人声单音化 | 未按乐器分档的完整阈值表；以保守为优先 |
@@ -65,9 +65,9 @@ Guitar Pro 本身也不内嵌：网页使用 MPL-2.0 的 alphaTab 阅读/播放 
 | 手型位置上的 Viterbi 指法 | 候选位置枚举 + 跨度限制 + 手位/换弦/大跳转移代价的 DP；支持预设调弦、调弦建议 | 代价函数和候选剪枝为本项目实现；不做 TabForge 的 lead/rhythm 自动拆分 |
 | 保守的技巧标记 | 仅对同弦、间隔 0–60 ms、1–4 半音、非重音的相邻单音标记 hammer-on/pull-off；Basic Pitch 音高轮廓净移动 ≥0.7 半音且单调时标出滑音 | 不识别推弦、颤音、闷音、泛音；没有音高弯音轨 |
 | PyGuitarPro 导出 + 回读校验 | `gp_writer` 写 GP5，`parse_gp5` 对象身份回读校验每小节时值 | 只写 GP5（5.1），不写 GPX/GP7/MusicXML |
-| FastAPI jobs、内存任务、进度轮询、文件下载 | 本项目的 `api.py`：单 worker、轮询、本地文件白名单、上传大小/时长限制 | 任务只在内存中；服务重启后需重新上传；输出目录仍在磁盘 |
+| FastAPI jobs、内存任务、进度轮询、文件下载 | 本项目的 `api.py`：单 worker、轮询、本地文件白名单、上传大小/时长限制；启动时从 `output/*/meta.json` 恢复已完成任务 | 运行中的任务不持久化；输出目录不会自动清理 |
 | 分轨缓存与“改选择不重跑 Demucs” | 内容寻址缓存（归一化 WAV 内容 + 模型 + 分离参数）位于 `work/.stem_cache/` | 缓存粒度是完整四轨；没有分阶段 UI |
-| alphaTab 读取 GP5，在线播放与改谱 | 浏览器预览/播放；语义编辑（弦/品/删除/静音）回传服务器 | 浏览器不写 GP5；没有完整撤销栈 |
+| alphaTab 读取 GP5，在线播放与改谱 | 浏览器预览/播放；语义编辑（弦/品/删除/静音/独奏/整轨移调/标记）回传服务器，支持一步撤销 | 浏览器不写 GP5；没有多步撤销或 lead/rhythm 拆分 |
 
 TabForge 的许可证是 MIT；本项目的 alphaTab（MPL-2.0）、Bravura（SIL OFL）、Sonivox 音色（Apache-2.0）、PyGuitarPro（LGPL-3.0）的许可证文件随 vendored 资源分发。
 
@@ -84,15 +84,15 @@ TabForge 的许可证是 MIT；本项目的 alphaTab（MPL-2.0）、Bravura（SI
                     │ HTTP
 ┌───────────────────▼───────────────────────────────────────────┐
 │ FastAPI（audio2gp/api.py）                                     │
-│  JobManager：内存任务 + 单 worker ThreadPoolExecutor            │
+│  JobManager：活动任务内存 + 已完成任务启动恢复 + 单 worker      │
 │  上传限制、ffprobe 时长校验、文件白名单、per-job edit_lock      │
 └───────────────────┬───────────────────────────────────────────┘
                     │ pipeline.run(...)
 ┌───────────────────▼───────────────────────────────────────────┐
 │ Python 管线（audio2gp/pipeline.py）                            │
-│ Stage 0 preprocess → Stage 1 rhythm → Stage 2 separate        │
-│ → Stage 3 tempo/key → Stage 4 transcribe → Stage 5 clean       │
-│ → Stage 5 chords → Stage 6 fingering → Stage 7 GP5/export       │
+│ 音频：Stage 0–4（preprocess/rhythm/separate/analyze/transcribe）│
+│ MIDI：Stage 0b 导入（跳过 1–4）                                 │
+│ → Stage 5 clean/chords → Stage 6 fingering → Stage 7 GP5/export │
 │ → Stage 8 editor IR (GP5 mode; MIDI-only skips 6/7/8 exports)    │
 └───────────────────┬───────────────────────────────────────────┘
                     │ tracks.json
@@ -116,6 +116,8 @@ TabForge 的许可证是 MIT；本项目的 alphaTab（MPL-2.0）、Bravura（SI
 
 阶段名称与 API 进度条对应关系：`preprocess`、`rhythm`、`separate`、`analyze`、`transcribe`、`post`、`gp5`；Stage 8 不占用任务进度，由后续编辑端点触发。
 
+`.mid`/`.midi` 输入走 Stage 0b：跳过 Stage 1–4 的音频分析与 Demucs/Basic Pitch，直接进入 Stage 5；`separate`/`analyze`/`transcribe` 阶段直接上报 100%，`rhythm.mode = "midi"`，`device = "midi"`。meta 写入 `input_kind: "midi"`。
+
 ### Stage 0：输入校验、归一化与初始速度
 
 **输入**：上传的音频文件。  
@@ -123,13 +125,23 @@ TabForge 的许可证是 MIT；本项目的 alphaTab（MPL-2.0）、Bravura（SI
 
 步骤：
 
-1. API 校验扩展名、非空、上传大小（默认 200 MB）和时长（默认 600 s）；CLI 也校验文件存在和非空。
+1. API 校验扩展名、非空、上传大小（默认 200 MB）和时长（默认 600 s）；音频用 `ffprobe`，MIDI 用 `midi_duration`。CLI 也校验文件存在和非空。
 2. `ffmpeg -vn -ac 2 -ar 44100 -c:a pcm_s16le -map_metadata -1` 归一化；去除封面/视频流。
 3. `ffprobe` 读取时长。
-4. 若 `bpm_override > 0` 直接采用；否则 librosa 在 HPSS 打击成分上估计速度，折叠到 60–180，失败回退 120 BPM 并警告。
+4. 若 `bpm_override` 存在（20–300）直接采用；否则 librosa 在 HPSS 打击成分上估计速度，折叠到 60–180，失败回退 120 BPM 并警告。
 5. 超过 2048 小节时警告（GP5 文件会很大）。
 
 失败策略：归一化失败是致命错误（`PipelineError("preprocess", ...)`），写出错误 `meta.json`。首次 API 任务在 `work/<job>/` 下保存上传文件。
+
+### Stage 0b：MIDI 导入（`midi_in.py`）
+
+**输入**：`.mid`/`.midi` 文件、用户所选拍号与 `selected_stems`。
+**输出**：`dict[stem, list[NoteEvent]]`、首速度 BPM、文件时长、警告；不写 WAV。
+
+- 用共享 `midifile.load_midi_notes` 读取绝对时间音符；通道 9 → `drums`；轨名含 drum/perc/鼓、bass/贝斯、vocal/voice/sing/人声/唱、guitar/gtr/key/piano/吉他/钢琴时优先按名字归类；否则按 GM program：32–39 bass、24–31 guitar → other、52–54 → vocals，其余归 other。
+- `selected` 取用户所选声部与文件实际声部的交集；为空则报错。
+- BPM 取首个 `set_tempo`；多个速度事件时警告“仅使用首个速度”。文件拍号与页面拍号不同时警告，但小节线仍按页面拍号重划。
+- 跳过调性、鼓速校正、和弦音频分析；`reference.mid` 直接复制上传文件。
 
 ### Stage 1：拍点、强拍与小节网格
 
@@ -140,9 +152,9 @@ TabForge 的许可证是 MIT；本项目的 alphaTab（MPL-2.0）、Bravura（SI
 
 1. **拍号**：`config.parse_time_signature` 只接受 4/4、3/4、2/4、6/8、9/8、12/8，计算 `bar_ticks = numerator * 3840 // denominator`（四分音符 = 960 ticks）。4/4 = 3840、3/4 = 2880、2/4 = 1920、6/8 = 2880、9/8 = 4320、12/8 = 5760。复合拍（6/8、9/8、12/8）的律动单位是附点四分（1440 ticks），每小节分别 2/3/4 个 pulse；单拍子拍号每拍 = 四分音符。
 2. **手动强拍**：若 `manual_downbeat_s` 已设置，直接作为第一个强拍，跳过自动分析，适用于任何拍号。
-3. **4/4 自动分析**：未手动指定时，仅 4/4 使用 `madmom-infer` 的 `DOWNBEATS_BLSTM`，强制 4/4 解码；得到 beat/downbeat 时间。根据强拍中位间隔计算 BPM；若与 Stage 0 的估计相差过大，使用强拍 BPM。madmom 不可用时回退 librosa 拍点 + 低频重音相位。仍失败则关闭对齐并警告，小节从音频 0 秒开始。
-4. **非 4/4 且未手动指定**：自动强拍模型只支持 4/4，直接跳过自动分析，记录“自动强拍分析目前只支持 4/4”警告，第 1 小节从音频 0 秒开始。
-5. `--no-align-downbeats` 关闭以上自动分析；手动强拍优先于该开关，仍然生效。没有手动值时第 1 小节从音频 0 秒开始。
+3. **4/4 自动分析**：未手动指定时，使用 `madmom-infer` 的 `DOWNBEATS_BLSTM`，强制 4/4 解码；得到 beat/downbeat 时间。根据强拍中位间隔计算 BPM；若与 Stage 0 的估计相差过大，使用强拍 BPM。madmom 不可用时回退 librosa 拍点 + 低频重音相位。仍失败则关闭对齐并警告，小节从音频 0 秒开始。
+4. **其他拍号自动分析**：不走 madmom，改用 librosa 拍点；用 `meter.bar_seconds(raw_bpm) / median_interval` 推算每小节拍数，再用按该分组计算的 `_accent_phase_score` 选强拍相位。librosa 或拍点不足时失败，小节从音频 0 秒开始并警告。
+5. `--no-align-downbeats` 关闭以上自动分析；手动强拍优先于该开关，仍然生效。没有手动值时第 1 小节从音频 0 秒开始。MIDI 输入跳过本阶段，直接使用文件时间轴。
 
 **小节原点**（`choose_grid_offset(first_downbeat, first_note, bpm, beats_per_bar=meter.numerator, denominator=meter.denominator)`）：
 
@@ -235,7 +247,7 @@ BPM 始终按**四分音符**计（MIDI 标准）。12/8 中一个附点四分 p
 **输入**：所选 `other`/`bass`/`vocals` 和声分轨、BPM、网格偏移/时长、key（可选）。  
 **输出**：`ChordEvent(start_tick, end_tick, start_s, end_s, label, root, quality, confidence)`；`chords.json`。
 
-- 22.05 kHz 读取分轨，HPSS harmonic 后取 CQT chroma；每帧先 L2 归一化再加权平均：`other=1.0`、`bass=0.8`、`vocals=0.3`，未知来源 0.65，避免高能声部主导。
+- 22.05 kHz 读取分轨，HPSS harmonic 后取 CQT chroma（每半音 3 个 bin，`bins_per_octave=36`，避免强低频泄漏到相邻半音而幻觉出七和弦）；每帧先 L2 归一化再加权平均：`other=1.0`、`bass=0.8`、`vocals=0.3`，未知来源 0.65，避免高能声部主导。
 - 分析仍按四分音符（960 ticks）同步求均值；以 75 分位帧能量为参考做静音判断，静音段不产生和弦，允许进行中存在空拍。`bar`/`beat` 标签使用所选拍号：复合拍的 `beat` 是附点四分 pulse（见 `chords_to_dict`），tick 坐标本身不变。
 - 谐波抑制：从 chroma 中减去上方五度/大三度的谐波能量，再减中位数、归一化，降低把大三和弦误判为 maj7 的概率。
 - 12 根 × 8 品质模板（major/minor/7/maj7/m7/sus4/dim/power）打分；加入根音、模板外能量、扩展音惩罚；key 可用时给音阶内根音/和弦音小幅加权。
@@ -369,16 +381,23 @@ BPM 始终按**四分音符**计（MIDI 标准）。12/8 中一个附点四分 p
 | `GET` | `/api/jobs/{id}/state` | 读取 IR |
 | `GET` | `/api/jobs/{id}/score.gp5` | 当前 GP5（no-store） |
 | `GET` | `/api/jobs/{id}/audio/{stem}` | 试听分轨（output 或 work） |
-| `GET` | `/api/jobs/{id}/files/{path}` | 白名单下载（GP5/MIDI/stems/meta/tracks/chords/ZIP） |
+| `GET` | `/api/jobs/{id}/files/{path}` | 白名单下载（GP5/MIDI/reference.mid/stems/meta/tracks/chords/flags/ZIP） |
 | `PATCH` | `/api/jobs/{id}/tracks/{tid}/notes/{nid}` | `{revision,string?,fret?,pitch?}` 改位置 |
 | `DELETE` | `/api/jobs/{id}/tracks/{tid}/notes/{nid}?revision=N` | 删除音符 |
 | `PUT` | `/api/jobs/{id}/tracks/{tid}/mute` | `{revision,muted}` 持久化静音 |
+| `POST` | `/api/jobs/{id}/tracks/{tid}/transpose` | `{revision,semitones}` 整轨移调并重新指法 |
+| `PUT` | `/api/jobs/{id}/tracks/{tid}/notes/{nid}/flag` | `{revision,flagged,reason?}` 写入 `flags.json` |
+| `POST` | `/api/jobs/{id}/undo` | `{revision}` 从 `.previous-tracks.json` 恢复一步 |
 
 语义：
 
 - **只改 string**：保持音高，推导新品；**只改 fret**：保持弦，音高随之改变；**string+fret**：音高随之改变；若同时给 pitch 且不匹配则 422。
 - **删除**：移除 IR 音符，下一 revision 重新生成 GP5/MIDI。
 - **静音**：写入 IR、重新生成并刷新结果；导出文件中仍保留该轨，取消静音恢复。alphaTab 预览用它实时静音。
+- **独奏**：纯前端预览状态，不写 IR、不生成文件；独奏时覆盖已持久化的静音。
+- **移调**：按 onset 分组、同一 onset 内先处理可选位置最少的音；每个音选离原位置最近的合法弦品（`|string-old|*2 + |pitch-open-fret|`），安放不下的音丢弃并报告数量。成功后保存 `.previous-tracks.json`，revision+1。
+- **撤销**：只在存在 `.previous-tracks.json` 时可用；恢复上一版 IR 后删除该文件，因此只支持一步。音符编辑、移调、静音会生成撤销步骤；独奏和标记不会。
+- **标记**：`flags.json` 记录 track/note ID、原因（≤200 字）和时间；不改 revision、不重新生成谱面；删除音符会清理对应标记。
 - 所有写操作先校验，再在 `output/` 内暂存临时 GP5/MIDI，成功后用 `os.replace` 原子发布；失败不会破坏旧文件。成功后更新 `tracks.json`、`meta.json`、ZIP，revision+1。
 
 **浏览器**：
@@ -386,7 +405,7 @@ BPM 始终按**四分音符**计（MIDI 标准）。12/8 中一个附点四分 p
 - alphaTab 读取 GP5（**浏览器不能写 GP5**），`core.includeNoteBounds=true` 才能收到 `noteMouseDown`；本地 vendored alphaTab/SoundFont/Bravura 字体，离线可用。
 - 点击音符：alphaTab 的弦号 `a` 与 IR 的弦号换算为 `IR = N - a + 1`；按 `start_tick + pitch + string` 映射到稳定 ID。
 - 编辑成功：刷新下载链接，使用 revision/cache buster 重新加载同一个 AlphaTabApi；失败显示服务器返回原因（例如“同拍该弦已占用”）。
-- 页面 URL 带 `?job=<id>`，刷新可恢复仍在内存中的任务和已完成结果；服务重启后任务内存丢失，但磁盘输出仍在。
+- 页面 URL 带 `?job=<id>`，刷新可恢复仍在内存中的任务和已完成结果；服务重启后 `JobManager` 从 `output/*/meta.json` 重建已完成任务（最新 200 个），运行中的任务丢失。
 - 结果页根据 `output_format` 切换布局：MIDI-only 隐藏 alphaTab/编辑/混音工作区，显示“仅 MIDI”说明和和弦时间线；GP5 模式显示谱面、编辑器、和弦时间线。和弦时间线标出低置信度段（<0.35）。
 
 ---
@@ -396,8 +415,12 @@ BPM 始终按**四分音符**计（MIDI 标准）。12/8 中一个附点四分 p
 ```
 audio2gp/
   api.py          FastAPI、JobManager、静态文件、编辑端点
-  pipeline.py     Stage 0–7 编排、进度预算、meta/ZIP
+  pipeline.py     Stage 0–7 编排、进度预算、meta/ZIP、MIDI 分支
   preprocess.py   ffmpeg 归一化、初始 BPM
+  midi_in.py      MIDI 导入、轨→声部映射、速度/拍号警告
+  midifile.py     共享 MIDI 读取、TempoMap、时长/速度/拍号查询
+  engines.py      外部转录命令模板、占位符展开、逐声部子进程
+  evaluation.py   per-stem MIDI 评分（P/R/F1、八度、泄漏）
   rhythm.py       madmom 强拍、librosa 回退、鼓速校正、网格偏移
   separate.py     Demucs、CUDA/OOM、内容寻址分轨缓存（实现）
   separation.py   稳定的分轨接口别名，重导出 separate
@@ -426,8 +449,12 @@ pipeline.run(input_path, options, progress_cb=None, *, job_id=None) -> RunResult
 
 preprocess.prepare(input_path, work_dir, options, logger=None, progress_cb=None)
     -> PreprocessedAudio
+midi_in.prepare(path, options, logger=None) -> MidiInput
+engines.transcribe_external(stems, options, bpm, logger=None, progress_cb=None)
+    -> (dict[str, list[NoteEvent]], warnings)
 
-rhythm.analyze_rhythm(wav_path, logger=None, progress_cb=None) -> RhythmInfo
+rhythm.analyze_rhythm(wav_path, logger=None, progress_cb=None, *, meter="4/4")
+    -> RhythmInfo
 rhythm.refine_tempo_from_drums(path, reference_bpm, logger=None) -> (bpm, warnings)
 rhythm.choose_grid_offset(first_downbeat_s, first_note_s, bpm, *,
                           beats_per_bar=4, denominator=4) -> float
@@ -477,6 +504,10 @@ score_ir.update_note_position(state, track_id, note_id, *, string=None,
                               fret=None, pitch=None) -> dict
 score_ir.delete_note(state, track_id, note_id) -> dict
 score_ir.set_track_muted(state, track_id, muted) -> dict
+score_ir.transpose_track(state, track_id, semitones) -> dict
+score_ir.undo_last_edit(out_dir) -> dict | None
+score_ir.set_note_flag(out_dir, state, track_id, note_id, flagged, reason) -> list
+score_ir.load_flags(out_dir, state) -> list
 score_ir.commit_state(state, out_dir) -> {state, gp5, midi, full_midi, zip, warnings, meta}
 ```
 
@@ -489,6 +520,7 @@ score_ir.commit_state(state, out_dir) -> {state, gp5, midi, full_midi, zip, warn
 ```json
 {
   "demucs_model": "htdemucs_ft",
+  "transcription_engine": "basic_pitch",
   "quantize": 16,
   "guitar_stem": "other",
   "keep_stems": true,
@@ -518,9 +550,9 @@ score_ir.commit_state(state, out_dir) -> {state, gp5, midi, full_midi, zip, warn
 }
 ```
 
-`time_signature` 只能是 4/4、3/4、2/4、6/8、9/8、12/8（其他值 422）；这是用户选择，不做自动拍号识别。`manual_downbeat_s` 是源音频秒数，`> 0` 或 `null`（0 在 CLI 中表示未设置）；设置后覆盖自动强拍分析，适用于任何拍号。自动强拍分析仅 4/4；其他拍号未设置手动强拍时第 1 小节从音频开头开始。`/api/limits` 的 `time_signatures`、`manual_downbeat`、`auto_downbeat_time_signatures` 描述这些能力；任务结果额外返回 `time_signature`、`bar_ticks`、`manual_downbeat_s`。
+`time_signature` 只能是 4/4、3/4、2/4、6/8、9/8、12/8（其他值 422）；这是用户选择，不做自动拍号识别。`manual_downbeat_s` 是源音频秒数，`> 0` 或 `null`（0 在 CLI 中表示未设置）；设置后覆盖自动强拍分析，适用于任何拍号。自动强拍分析覆盖所有拍号：4/4 走 madmom，其他走 librosa；MIDI 输入忽略手动强拍和自动分析。`/api/limits` 的 `time_signatures`、`manual_downbeat`、`auto_downbeat_time_signatures`、`transcription_engines`、`external_engine_configured` 描述这些能力；任务结果额外返回 `time_signature`、`bar_ticks`、`manual_downbeat_s`、`input_kind`、`flags`、`can_undo`。
 
-`selected_stems` 只控制转录/交付，不影响 Demucs 始终分离四轨。至少要选一轨。`export_gp5=true` 时组合还必须能产生至少一条 GP5 轨（例如只选 vocals、关闭人声旋律轨、吉他来源是 other → 422）；`export_gp5=false` 不受此限制。`detect_chords=false` 时不分析、不写 `chords.json`、不写 MIDI marker；GP5 模式下也不写和弦符号。
+`selected_stems` 只控制转录/交付，不影响 Demucs 始终分离四轨。至少要选一轨。MIDI 输入时取所选声部与文件实际声部的交集。`export_gp5=true` 时组合还必须能产生至少一条 GP5 轨（例如只选 vocals、关闭人声旋律轨、吉他来源是 other → 422）；`export_gp5=false` 不受此限制。`detect_chords=false` 时不分析、不写 `chords.json`、不写 MIDI marker；GP5 模式下也不写和弦符号。MIDI 输入始终跳过音频和弦分析。`transcription_engine="external"` 要求 `AUDIO2GP_EXTERNAL_CMD`；未配置或执行失败时整项任务回退 Basic Pitch 并写警告。
 
 ---
 
@@ -531,20 +563,23 @@ output/<job_id>/
   stems/<selected>.wav       # keep_stems=true
   midi/<selected>.mid
   midi/full.mid
+  midi/reference.mid         # 未编辑转录快照（MIDI 输入时复制原文件）
   song.gp5                   # 仅 GP5 模式；失败时可能不存在
   tracks.json                # 仅 GP5 模式；Score IR（可编辑）
-  chords.json                # 和弦分析启用时；可能为空结果
+  .previous-tracks.json      # 一步撤销快照（隐藏，不进入 ZIP）
+  flags.json                 # 有标记音符时；不进入撤销
+  chords.json                # 音频和弦分析启用时；可能为空结果
   meta.json
   audio2gp_<job_id>.zip
 work/<job_id>/
   <upload>.*
-  song.wav
+  song.wav                   # 音频输入才有
   stems/                     # 未 keep 时仍在此供试听
   pipeline.log
 work/.stem_cache/<hash>/     # 四轨 + meta.json，不进入输出
 ```
 
-`meta.json` 包含：状态、`output_format`、输入信息、BPM/来源/时长、`time_signature`/`bar_ticks`、设备、选项、`selected_stems`、`rhythm`（含 `mode`、`time_signature`、`beats_per_bar`、`beat_unit`、`bar_ticks`、`first_downbeat_s`、`auto_alignment_supported`）、`key`、`chords`（segments/summary，segment 带拍号相关 `bar`/`beat`）、警告、每轨音符数、小节数、轨道名、调弦、revision、耗时、文件路径、GP5 错误（若有）。MIDI-only 的 `files` 不含 `gp5`/`tracks`。ZIP 使用相对路径，排除 `.stem_cache`。
+`meta.json` 包含：状态、`output_format`、`input_kind`、输入信息、BPM/来源/时长、`time_signature`/`bar_ticks`、设备（MIDI 输入为 `"midi"`）、选项、`selected_stems`、`rhythm`（含 `mode`、`time_signature`、`beats_per_bar`、`beat_unit`、`bar_ticks`、`first_downbeat_s`、`auto_alignment_supported`）、`key`、`chords`（segments/summary，segment 带拍号相关 `bar`/`beat`）、警告、每轨音符数、小节数、轨道名、调弦、revision、耗时、文件路径、GP5 错误（若有）。MIDI-only 的 `files` 不含 `gp5`/`tracks`。ZIP 使用相对路径，排除 `.stem_cache` 与 `.previous-tracks.json`。`JobManager` 启动时按 `meta.json` 的 `status`（`ok`/`partial`）重建最多 200 个最新任务。
 
 ---
 
@@ -600,15 +635,19 @@ scripts/setup_env.sh
 - `test_fingering.py`：合法位置、跨度、空弦优先、DP 连续性、调弦/调弦建议、技巧；
 - `test_drums.py`：合成 kick/snare/hat 的 GM 映射、力度、去重、空轨；
 - `test_gp_writer.py`：onset/tie、跨小节 tie、三连音、打击乐、每小节 voice 0 = 3840、回读、和弦符号与超范围警告；
-- `test_score_ir.py`：稳定 ID、往返、改弦品、冲突、删除/静音、原子重建 GP5/MIDI/meta/ZIP、和弦持久化/重建/校验；
+- `test_score_ir.py`：稳定 ID、往返、改弦品、冲突、删除/静音、原子重建 GP5/MIDI/meta/ZIP、和弦持久化/重建/校验、整轨移调/撤销/标记；
 - `test_stem_cache.py`：内容寻址键、模型隔离、缓存命中复制、缺轨/空轨失效、不覆盖已有条目；
-- `test_api.py`：上传校验、任务生命周期、下载、IR 编辑、revision 409、路径白名单、选项透传、任务恢复、MIDI-only 结果/和弦下载；
-- `test_pipeline.py`：阶段顺序/单调进度、选择分轨组合、空轨、GP5 部分成功、MIDI-only 不写 GP5/IR、和弦 JSON/GP5/marker/meta、3/4 手动强拍不触发自动分析、非 4/4 无手动强拍时的警告；
+- `test_midi_in.py`：轨名/GM/通道 → 声部映射、多速度与拍号警告、MIDI 管线跳过音频阶段；
+- `test_engines.py`：外部命令占位符展开、逐声部写出 MIDI、缺配置/未知占位符错误；
+- `test_evaluation.py`：onset/pitch 匹配、八度与泄漏统计、目录评分；
+- `test_six_stem_experiment.py`：实验脚本的秒→tick 转换；
+- `test_api.py`：上传校验、任务生命周期、下载、IR 编辑、revision 409、路径白名单、选项透传、MIDI 上传、重启恢复/损坏目录跳过、MIDI-only 结果/和弦下载；
+- `test_pipeline.py`：阶段顺序/单调进度、选择分轨组合、空轨、GP5 部分成功、MIDI-only 不写 GP5/IR、和弦 JSON/GP5/marker/meta、3/4 手动强拍、非 4/4 走拍号感知自动分析；
 - `test_web_app.py`：旧 Gradio 冒烟。
 
 **慢测试**（`-m slow`，真实模型）：合成混音与真实歌曲片段；分轨非空、MIDI 音符数、GP5 回读每小节等于所选拍号小节长度（默认 4/4 为 3840）、ZIP、第二次运行结构一致。
 
-快速套件在本机为 139 passed、3 deselected。
+快速套件在本机为 166 passed、3 deselected；质量评估脚本见 `docs/eval.md`。
 
 **浏览器测试**（手动/开发）：
 
@@ -616,8 +655,11 @@ scripts/setup_env.sh
 - 确认和弦时间线/下载 `chords.json`；MIDI-only 任务隐藏谱面并显示说明；
 - 点击吉他音符 → 右栏出现候选弦品；确认已占用弦位被禁用；
 - 应用候选 → revision+1，`song.gp5`/MIDI/ZIP 更新，alphaTab 重载；
-- 删除音符、静音/取消静音；
-- 两个标签页用旧 revision 编辑 → 第二个得到 409。
+- 删除音符、静音/取消静音、独奏覆盖静音；
+- 整轨移调 ±1/±12 → 音符重新指法，无法安放的音被丢弃并提示；
+- 撤销 → 回到上一版且按钮消失；标记/取消标记 → `flags.json` 更新且不改变 revision；
+- 两个标签页用旧 revision 编辑 → 第二个得到 409；
+- 重启服务后打开 `/?job=<id>` → 任务仍可加载。
 
 **验收门槛**：PyGuitarPro 回读 + 结构校验；本机没有 Guitar Pro/TuxGuitar，视觉最终验收需用户在制谱软件中打开。不能声称“专业级记谱”。
 
@@ -647,27 +689,28 @@ scripts/setup_env.sh
 **当前限制**：
 
 - 每个任务只能固定一种用户选择的拍号（4/4、3/4、2/4、6/8、9/8、12/8），**无自动拍号识别**，无曲中变拍号/速度图；BPM 始终按四分音符计，复合拍的显示速度与“每分钟附点四分”的记法不同；
-- 自动强拍模型仅支持 4/4；非 4/4 未手动指定首强拍时第 1 小节从音频开头开始并警告；强拍模型可能在硬摇摆、长自由前奏、串烧中锁错相位，用户可改用手动强拍或关闭对齐；
+- 4/4 自动强拍用 madmom，其他拍号用 librosa 拍点 + 重音相位；后者可能锁错相位，强拍模型也可能在硬摇摆、长自由前奏、串烧中出错，用户可改用手动强拍或关闭对齐；
 - 弱起写成完整前置小节，不是短 anacrusis；
-- 旋律转录仅 Basic Pitch，未做多引擎/乐器特定模型；
+- 内置旋律转录仅 Basic Pitch；可选外部命令引擎，未实现多引擎自动选择或乐器特定模型；
 - 鼓为启发式分类，桶鼓/镲片最不可靠；
 - 指法是近似最优，和弦/高把位/特殊调弦可能八度折叠或丢音（有警告）；
 - 和弦检测只给根音+品质，不识别转位/斜杠和弦/voicing/和弦图；power chord、暴露七度、密集失真可能被简化，低置信度会在 UI 标出；
 - MIDI-only 没有谱面/编辑器；GP5 和弦符号只标注第一条非打击乐轨；
 - 不检测推弦、颤音、闷音、泛音；
 - 只写 GP5，不写 GPX/GP7/MusicXML；
-- 编辑仅限改弦/品、删除、静音；无撤销、无批量移调、无 lead/rhythm 拆分；
-- 任务是进程内内存记录，服务重启后无法从 UI 恢复（磁盘文件仍在）；
+- 编辑支持改弦/品、删除、静音、独奏、一步撤销、整轨移调和音符标记；无多步撤销、无 lead/rhythm 拆分；
+- MIDI 输入只保留首个速度事件和页面拍号，不保留原速度图/曲中变拍号；轨→声部映射是启发式；
+- 已完成任务启动时从 `output/*/meta.json` 恢复（最新 200 个）；运行中的任务重启后丢失，磁盘文件仍在；
 - alphaTab 只读 GP5，所有编辑必须经服务器；MIDI-only 不提供编辑。
 
 **后续优先级**：
 
 1. 手型搜索增加“保持音/和弦形状”约束，减少八度折叠；
-2. 非 4/4 的自动强拍/拍号分析，或曲中拍号变化支持（当前由用户固定拍号并可手动指定首强拍）；
+2. 改进非 4/4 自动强拍相位，或支持曲中拍号/速度变化；
 3. 更细的鼓件/力度模型；
-4. 编辑器加入一次撤销与批量移调；
-5. 多引擎转录接口（保持默认本地、无 LLM）；
-6. 任务持久化/恢复。
+4. 多步撤销、lead/rhythm 拆分；
+5. 用多首歌的评估结果决定是否把 `htdemucs_6s` 吉他轨纳入产品；
+6. 外部引擎适配器与置信度融合（保持默认本地、无 LLM）。
 
 ---
 

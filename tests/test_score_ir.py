@@ -142,6 +142,78 @@ def test_move_rejects_impossible_and_colliding_positions() -> None:
         )
 
 
+def test_bulk_transpose_refingers_and_reports_drops() -> None:
+    state = _state()
+    result = score_ir.transpose_track(state, "guitar", 1)
+    assert result["changed"] == 3
+    assert result["dropped"] == 0
+    track = score_ir.get_track(state, "guitar")
+    assert [note["pitch"] for note in track["notes"]] == [65, 60, 68]
+    for note in track["notes"]:
+        assert note["pitch"] == track["tuning"][note["string"] - 1] + note["fret"]
+        assert 0 <= note["fret"] <= state["max_fret"]
+
+    with pytest.raises(score_ir.StateError, match="drum tracks"):
+        score_ir.transpose_track(state, "drums", 1)
+    with pytest.raises(score_ir.StateError, match="not be zero"):
+        score_ir.transpose_track(state, "guitar", 0)
+    with pytest.raises(score_ir.StateError, match="between -24 and 24"):
+        score_ir.transpose_track(state, "guitar", 25)
+    with pytest.raises(score_ir.StateError, match="no playable notes"):
+        score_ir.transpose_track(_state(), "guitar", 24)
+
+
+def test_undo_restores_the_previous_committed_state(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    state = _state()
+    write_json(
+        out_dir / "meta.json",
+        {"job_id": "job-1", "status": "ok", "files": {"midi": {}, "meta": "meta.json"}},
+    )
+    write_json(out_dir / "tracks.json", state)
+    score_ir.update_note_position(state, "guitar", "n000001", fret=2)
+    first = score_ir.commit_state(state, out_dir)
+    assert first["state"]["revision"] == 1
+    assert (out_dir / score_ir.PREVIOUS_STATE).is_file()
+
+    undone = score_ir.undo_last_edit(first["state"], out_dir)
+    assert undone["state"]["revision"] == 2
+    note = score_ir.get_note(score_ir.get_track(undone["state"], "guitar"), "n000001")
+    assert (note["string"], note["fret"], note["pitch"]) == (1, 0, 64)
+    assert not (out_dir / score_ir.PREVIOUS_STATE).exists()
+    with pytest.raises(score_ir.StateError, match="没有可撤销"):
+        score_ir.undo_last_edit(undone["state"], out_dir)
+
+
+def test_flags_are_metadata_and_ignore_stale_notes(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    state = _state()
+    first = score_ir.set_note_flag(
+        state, out_dir, "guitar", "n000003", flagged=True, reason="sounds wrong"
+    )
+    assert first["flagged"] is True
+    assert first["flags"][0]["reason"] == "sounds wrong"
+    assert first["flags"][0]["bar"] == 1
+    assert state["revision"] == 0  # flags are not score edits
+
+    second = score_ir.set_note_flag(
+        state, out_dir, "bass", "n000004", flagged=True, reason=""
+    )
+    assert {
+        flag["note_id"]: flag["reason"] for flag in second["flags"]
+    } == {"n000003": "sounds wrong", "n000004": "需要人工检查"}
+
+    off = score_ir.set_note_flag(state, out_dir, "guitar", "n000003", flagged=False)
+    assert [flag["note_id"] for flag in off["flags"]] == ["n000004"]
+
+    score_ir.delete_note(state, "bass", "n000004")
+    assert score_ir.load_flags(out_dir, state) == []
+    with pytest.raises(score_ir.StateError, match="unknown note"):
+        score_ir.set_note_flag(state, out_dir, "guitar", "missing", flagged=True)
+
+
 def test_delete_note_and_mute_track() -> None:
     state = _state()
     deleted = score_ir.delete_note(state, "guitar", "n000001")

@@ -123,11 +123,13 @@ def _load_chroma(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
     harmonic = librosa.effects.harmonic(y, margin=3.0)
     if float(np.max(np.abs(harmonic))) < 1e-6:
         harmonic = y
+    # Three bins per semitone (librosa's default) keep a strong low note from
+    # leaking into its neighbours; one bin per semitone invents major sevenths.
     chroma = librosa.feature.chroma_cqt(
         y=harmonic,
         sr=SAMPLE_RATE,
         hop_length=HOP_LENGTH,
-        bins_per_octave=12,
+        bins_per_octave=36,
     )
     energy = np.linalg.norm(chroma, axis=0)
     norms = np.maximum(energy, 1e-9)

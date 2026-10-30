@@ -17,6 +17,7 @@ def test_defaults_cover_the_local_pipeline(tmp_path: Path) -> None:
     options = cli._options_from_args(_args(tmp_path))
     assert options.quantize == 16
     assert options.demucs_model == "htdemucs_ft"
+    assert options.transcription_engine == "basic_pitch"
     assert options.device == "auto"
     assert options.selected_stems == ("vocals", "drums", "bass", "other")
     assert options.guitar_tuning == "standard"
@@ -71,8 +72,11 @@ def test_new_flags_are_plumbed_to_options(tmp_path: Path) -> None:
             "--no-keep-stems",
             "--no-chords",
             "--midi-only",
+            "--engine",
+            "external",
         )
     )
+    assert options.transcription_engine == "external"
     assert options.selected_stems == ("vocals", "other")
     assert options.guitar_tuning == "drop_d"
     assert options.bass_tuning == "drop_d"
@@ -102,6 +106,11 @@ def test_bpm_override_and_zero(tmp_path: Path) -> None:
     assert cli._options_from_args(_args(tmp_path, "--bpm", "0")).bpm_override is None
 
 
+def test_bpm_override_outside_the_supported_range_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="bpm_override"):
+        cli._options_from_args(_args(tmp_path, "--bpm", "0.5"))
+
+
 def test_all_stems_alias_and_unknown_stem(tmp_path: Path) -> None:
     assert cli._options_from_args(_args(tmp_path, "--stems", "all")).selected_stems == (
         "vocals",
@@ -116,7 +125,7 @@ def test_all_stems_alias_and_unknown_stem(tmp_path: Path) -> None:
 def test_missing_input_exits_nonzero(tmp_path: Path, capsys) -> None:
     missing = tmp_path / "missing.wav"
     assert cli.main([str(missing)]) == 1
-    assert "input audio does not exist" in capsys.readouterr().err
+    assert "input file does not exist" in capsys.readouterr().err
 
 
 def test_main_propagates_pipeline_error(tmp_path: Path, monkeypatch, capsys) -> None:

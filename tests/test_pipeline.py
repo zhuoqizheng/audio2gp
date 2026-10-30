@@ -72,7 +72,7 @@ def _install_fakes(
             warnings=[],
         )
 
-    def fake_rhythm(wav_path, logger=None, progress_cb=None):
+    def fake_rhythm(wav_path, logger=None, progress_cb=None, *, meter=None):
         if progress_cb:
             progress_cb(100.0, "fake rhythm")
         return RhythmInfo(
@@ -227,6 +227,22 @@ def test_pipeline_writes_outputs_meta_zip_and_monotonic_progress(
     assert result.meta["audio"]["tempo_source"] == "drums-verified"
 
 
+def test_high_vocal_notes_respect_max_fret_in_editable_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    melodic = _melodic_events()
+    melodic["vocals"] = [NoteEvent(0.05, 0.40, 80, 0.8)]  # fret 16 in standard tuning
+    input_path, _sources = _install_fakes(monkeypatch, tmp_path, melodic=melodic)
+    result = pipeline.run(input_path, _options(tmp_path))
+
+    assert result.status == "ok"
+    assert not any("在线编辑状态" in warning for warning in result.meta["warnings"])
+    state = json.loads((result.out_dir / "tracks.json").read_text(encoding="utf-8"))
+    vocals = next(track for track in state["tracks"] if track["stem"] == "vocals")
+    assert vocals["notes"]
+    assert all(note["fret"] <= state["max_fret"] for note in vocals["notes"])
+
+
 def test_manual_downbeat_works_for_non_4_4_meter(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -264,21 +280,31 @@ def test_manual_downbeat_works_for_non_4_4_meter(
     assert verify_gp5(result.gp5, result.meta["measure_count"], 4, time_signature="3/4") == []
 
 
-def test_non_4_4_meter_without_manual_downbeat_skips_auto_analysis(
+def test_non_4_4_meter_runs_meter_aware_auto_analysis(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     input_path, _sources = _install_fakes(monkeypatch, tmp_path)
 
-    def unexpected_rhythm(*args, **kwargs):
-        raise AssertionError("automatic downbeat analysis is 4/4-only")
+    def fake_rhythm(wav_path, logger=None, progress_cb=None, *, meter=None):
+        assert meter is not None and meter.label == "6/8"
+        return RhythmInfo(
+            bpm=BPM,
+            beats_per_bar=3,
+            beat_times_s=[0.0, 0.5, 1.0, 1.5],
+            downbeat_times_s=[0.0, 1.5],
+            method="fake",
+        )
 
-    monkeypatch.setattr(pipeline.rhythm_mod, "analyze_rhythm", unexpected_rhythm)
+    monkeypatch.setattr(pipeline.rhythm_mod, "analyze_rhythm", fake_rhythm)
     result = pipeline.run(input_path, _options(tmp_path, time_signature="6/8"))
     assert result.status == "ok"
     rhythm = result.meta["rhythm"]
-    assert rhythm["mode"] == "unsupported-meter"
-    assert rhythm["grid_offset_s"] == 0.0
-    assert any("只支持 4/4" in warning for warning in result.warnings)
+    assert rhythm["mode"] == "auto"
+    assert rhythm["method"] == "fake"
+    assert rhythm["time_signature"] == "6/8"
+    assert rhythm["first_downbeat_s"] == 0.0
+    assert rhythm["auto_alignment_supported"] is True
+    assert not any("只支持 4/4" in warning for warning in result.warnings)
     song = gp.parse(str(result.gp5))
     for header in song.measureHeaders:
         assert (

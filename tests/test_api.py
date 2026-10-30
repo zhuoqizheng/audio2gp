@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import logging
 import shutil
 import time
 import wave
@@ -8,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import guitarpro as gp
+import mido
 import pytest
 from fastapi.testclient import TestClient
 
@@ -262,7 +265,15 @@ def test_static_ui_health_and_limits(client: TestClient) -> None:
         "12/8",
     ]
     assert limits["manual_downbeat"] is True
-    assert limits["auto_downbeat_time_signatures"] == ["4/4"]
+    assert limits["auto_downbeat_time_signatures"] == [
+        "4/4",
+        "3/4",
+        "2/4",
+        "6/8",
+        "9/8",
+        "12/8",
+    ]
+    assert limits["transcription_engines"] == ["basic_pitch", "external"]
     assert "exportFormatSelect" in index.text
     assert "detectChords" in index.text
     assert "chordPanel" in index.text
@@ -415,6 +426,79 @@ def test_edit_delete_mute_and_revision_conflict(client: TestClient) -> None:
     assert client.get(downloads["gp5"]).status_code == 200
 
 
+def test_transpose_undo_and_flags(client: TestClient) -> None:
+    created = _create_job(client)
+    _wait_done(client, created["id"])
+    base = f"/api/jobs/{created['id']}"
+    original = client.get(f"{base}/state").json()
+    original_pitches = [
+        note["pitch"] for note in score_ir.get_track(original, "guitar")["notes"]
+    ]
+
+    transposed = client.post(
+        f"{base}/tracks/guitar/transpose",
+        json={"revision": 0, "semitones": 12},
+    )
+    assert transposed.status_code == 200, transposed.text
+    assert transposed.json()["revision"] == 1
+    assert transposed.json()["changed"] == 3
+    assert transposed.json()["can_undo"] is True
+    assert [
+        note["pitch"]
+        for note in score_ir.get_track(transposed.json()["state"], "guitar")["notes"]
+    ] == [pitch + 12 for pitch in original_pitches]
+
+    undone = client.post(f"{base}/undo", json={"revision": 1})
+    assert undone.status_code == 200, undone.text
+    assert undone.json()["revision"] == 2
+    assert [
+        note["pitch"] for note in score_ir.get_track(undone.json()["state"], "guitar")["notes"]
+    ] == original_pitches
+    assert undone.json()["can_undo"] is False
+    assert client.post(f"{base}/undo", json={"revision": 2}).status_code == 422
+
+    flagged = client.put(
+        f"{base}/tracks/guitar/notes/n000003/flag",
+        json={"flagged": True, "reason": "wrong octave?"},
+    )
+    assert flagged.status_code == 200, flagged.text
+    assert flagged.json()["flag_count"] == 1
+    flag = flagged.json()["flags"][0]
+    assert (flag["note_id"], flag["reason"]) == ("n000003", "wrong octave?")
+    assert flag["bar"] == 1
+    flags_url = flagged.json()["files"]["flags"]
+    assert client.get(flags_url).json()["flags"][0]["note_id"] == "n000003"
+    refreshed = client.get(base).json()
+    assert refreshed["result"]["flag_count"] == 1
+    assert refreshed["result"]["flags"][0]["reason"] == "wrong octave?"
+
+    unflagged = client.put(
+        f"{base}/tracks/guitar/notes/n000003/flag",
+        json={"flagged": False},
+    )
+    assert unflagged.status_code == 200
+    assert unflagged.json()["flag_count"] == 0
+    assert client.get(flags_url).json()["flags"] == []
+
+
+def test_transpose_rejects_drums_and_bad_values(client: TestClient) -> None:
+    created = _create_job(client)
+    _wait_done(client, created["id"])
+    base = f"/api/jobs/{created['id']}"
+    assert client.post(
+        f"{base}/tracks/drums/transpose",
+        json={"revision": 0, "semitones": 12},
+    ).status_code == 422
+    assert client.post(
+        f"{base}/tracks/guitar/transpose",
+        json={"revision": 0, "semitones": 0},
+    ).status_code == 422
+    assert client.post(
+        f"{base}/tracks/guitar/transpose",
+        json={"revision": 0, "semitones": 25},
+    ).status_code == 422
+
+
 def test_invalid_edits_are_rejected(client: TestClient) -> None:
     created = _create_job(client)
     _wait_done(client, created["id"])
@@ -535,6 +619,7 @@ def test_runner_receives_safe_option_values(tmp_path: Path) -> None:
             "selected_stems": ["other", "bass"],
             "max_fret": 19,
             "bpm_override": 98.5,
+            "transcription_engine": "external",
         },
     )
     job = _wait_done(client, created["id"])
@@ -548,6 +633,7 @@ def test_runner_receives_safe_option_values(tmp_path: Path) -> None:
     assert call["options"].selected_stems == ("bass", "other")
     assert call["options"].max_fret == 19
     assert call["options"].bpm_override == 98.5
+    assert call["options"].transcription_engine == "external"
     assert call["input"].is_file()
     assert call["input"].parent == tmp_path / "work" / created["id"]
 
@@ -608,3 +694,73 @@ def test_health_does_not_import_torch(client: TestClient) -> None:
     # module import time. The fake runner never touches the model stack.
     response = client.get("/api/health")
     assert response.json() == {"ok": True, "version": "0.2.0"}
+
+
+def _midi_bytes() -> bytes:
+    mid = mido.MidiFile(ticks_per_beat=480)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    track.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120), time=0))
+    track.append(mido.MetaMessage("track_name", name="Bass", time=0))
+    track.append(mido.Message("program_change", program=33, channel=0, time=0))
+    track.append(mido.Message("note_on", note=40, velocity=100, channel=0, time=0))
+    track.append(mido.Message("note_off", note=40, velocity=0, channel=0, time=480))
+    buffer = io.BytesIO()
+    mid.save(file=buffer)
+    return buffer.getvalue()
+
+
+def test_midi_upload_uses_the_midi_pipeline(tmp_path: Path) -> None:
+    client = TestClient(create_app(tmp_path / "output", tmp_path / "work"))
+    response = client.post(
+        "/api/jobs",
+        files={"file": ("song.mid", _midi_bytes(), "audio/midi")},
+        data={"options": json.dumps({"selected_stems": ["bass"]})},
+    )
+    assert response.status_code == 202, response.text
+    job = _wait_done(client, response.json()["id"])
+    assert job["status"] == "done", job
+    result = job["result"]
+    assert result["input_kind"] == "midi"
+    assert result["device"] == "midi"
+    assert result["score_url"]
+    assert result["note_counts"] == {"bass": 1}
+
+
+def test_completed_jobs_survive_restart_and_bad_dirs_are_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    output = tmp_path / "output"
+    job_dir = output / "job-midi"
+    job_dir.mkdir(parents=True)
+    write_json(
+        job_dir / "meta.json",
+        {
+            "job_id": "job-midi",
+            "status": "ok",
+            "created": "2026-01-01T00:00:00+00:00",
+            "input": {"name": "song.mid"},
+            "input_kind": "midi",
+            "audio": {"bpm": 120.0, "duration_s": 2.0},
+            "options": {},
+            "warnings": [],
+            "tracks": ["Bass"],
+        },
+    )
+    broken = output / "broken"
+    broken.mkdir()
+    (broken / "meta.json").write_text("{not json", encoding="utf-8")
+    interrupted = output / "interrupted"
+    interrupted.mkdir()
+    (interrupted / "chords.json").write_text("[]", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="audio2gp.api"):
+        client = TestClient(create_app(output, tmp_path / "work"))
+    assert "interrupted" not in caplog.text
+    job = client.get("/api/jobs/job-midi")
+    assert job.status_code == 200
+    payload = job.json()
+    assert payload["status"] == "done"
+    assert payload["original_name"] == "song.mid"
+    assert payload["result"]["input_kind"] == "midi"
+    assert client.get("/api/jobs/broken").status_code == 404

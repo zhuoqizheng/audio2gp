@@ -184,7 +184,7 @@ def _make_layer(
         # Last resort: drop the weakest notes until a legal subset exists.
         current = list(ordered)
         while current and not results:
-            current = current[:-1]  # ordered by velocity; drop weakest tail
+            current = sorted(current, key=lambda n: (-n.velocity, n.pitch))[:-1]
             warnings.append("fingering could not place the full chord; dropped the weakest note")
             candidate_lists = [
                 _candidates_for_pitch(n.pitch, tuning, max_fret) for n in current
@@ -391,8 +391,10 @@ def arrange_bass(
     )
 
 
-def arrange_vocals(notes: list[Note]) -> tuple[list[FingeredNote], list[str]]:
-    return arrange_guitar(notes, max_fret=24, monophonic=True)
+def arrange_vocals(
+    notes: list[Note], *, max_fret: int
+) -> tuple[list[FingeredNote], list[str]]:
+    return arrange_guitar(notes, max_fret=max_fret, monophonic=True)
 
 
 def arrangement_score(notes: list[Note], arranged: list[FingeredNote]) -> float:

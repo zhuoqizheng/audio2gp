@@ -5,3 +5,12 @@ scipy==1.11.4
 librosa==0.11.0
 scikit-learn==1.7.2
 resampy==0.4.2
+# Demucs 4.1.0 runtime deps (installed with --no-deps by setup_env.sh).
+einops==0.8.2
+huggingface-hub==2.3.0
+julius==0.2.8
+lameenc==1.9.0
+pyyaml==6.0.3
+safetensors==0.8.0
+sphn==0.2.1
+tqdm==4.70.1

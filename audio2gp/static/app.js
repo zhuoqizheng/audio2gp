@@ -43,6 +43,8 @@ const ui = {
   scoreState: null,
   selected: null,
   at: null,
+  solo: new Set(),
+  flags: [],
   pollTimer: null,
   pollFailures: 0,
   toastTimer: null,
@@ -144,8 +146,12 @@ function resetForNewJob() {
   ui.result = null;
   ui.scoreState = null;
   ui.selected = null;
+  ui.solo.clear();
+  ui.flags = [];
   ui.loadingResult = false;
   ui.pollFailures = 0;
+  renderUndo(false);
+  renderFlags();
   $("#resultPanel").hidden = true;
   $("#jobPanel").hidden = true;
   $("#scoreView").innerHTML = "";
@@ -173,6 +179,7 @@ function optionsPayload() {
   const manualDownbeat = toFloat("#manualDownbeat", 0);
   return {
     demucs_model: $("#modelSelect").value,
+    transcription_engine: $("#engineSelect").value,
     quantize: toInt("#quantizeSelect", 16),
     time_signature: $("#timeSignatureSelect").value,
     manual_downbeat_s: manualDownbeat > 0 ? manualDownbeat : null,
@@ -213,13 +220,21 @@ async function loadLimits() {
       const minutes = Number.isFinite(seconds) ? Math.round(seconds / 60) : null;
       $("#limitsNote").textContent = `当前上限 ${mb} MB${minutes ? ` / 约 ${minutes} 分钟` : ""}，可在启动参数中调整。`;
     }
+    const external = $("#engineSelect") && $("#engineSelect").querySelector('option[value="external"]');
+    if (external && limits.external_engine_configured === false) {
+      external.disabled = true;
+      const hint = $("#engineHint");
+      if (hint) {
+        hint.textContent = "当前未配置 AUDIO2GP_EXTERNAL_CMD，外部引擎不可选；设置该环境变量并重启服务后可选用。";
+      }
+    }
   } catch { /* keep the documented defaults when the endpoint is unavailable */ }
 }
 
 function validateForm(file) {
-  if (!file) return "请先选择一个音频文件。";
+  if (!file) return "请先选择一个音频或 MIDI 文件。";
   if (file.size > ui.maxUploadBytes) {
-    return `文件为 ${(file.size / (1024 * 1024)).toFixed(1)} MB，超过当前上传上限。请缩短音频或调整启动参数。`;
+    return `文件为 ${(file.size / (1024 * 1024)).toFixed(1)} MB，超过当前上传上限。请缩短文件或调整启动参数。`;
   }
   const selected = ["stemOther", "stemBass", "stemDrums", "stemVocals"]
     .filter((id) => $(`#${id}`).checked);
@@ -256,6 +271,7 @@ function renderJob(job) {
     return `${stamp}  [${label}] ${entry.message || ""}`;
   });
   const box = $("#logBox");
+  $("#logWrap").hidden = lines.length === 0;
   const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 12;
   box.textContent = lines.join("\n");
   if (atBottom) box.scrollTop = box.scrollHeight;
@@ -425,7 +441,10 @@ async function loadResult(job) {
     ui.scoreState = null;
     showToast(`读取编辑状态失败：${error.message}`, true);
   }
+  ui.flags = Array.isArray(job.result.flags) ? job.result.flags : [];
   renderMixer();
+  renderFlags();
+  renderUndo(Boolean(job.result.can_undo));
   const canScore = Boolean(job.result.state_url && job.result.score_url && ui.scoreState);
   $("#scoreWorkspace").hidden = !canScore;
   $("#noScoreNote").hidden = canScore;
@@ -439,7 +458,7 @@ async function loadResult(job) {
   } else {
     if (job.result.output_format === "midi_only") {
       $("#noScoreTitle").textContent = "仅 MIDI 模式：本次没有生成 GP5。";
-      $("#noScoreText").textContent = "分轨 MIDI、full.mid、和弦分析、分轨试听和 ZIP 仍可下载；和弦时间线显示在上方。若需要多轨 GP5 与在线改谱，请改用“GP5 + MIDI”输出格式。";
+      $("#noScoreText").textContent = "分轨 MIDI、full.mid、和弦分析、分轨试听和 ZIP 仍可下载；和弦时间线显示在下方。若需要多轨 GP5 与在线改谱，请改用“GP5 + MIDI”输出格式。";
     } else {
       $("#noScoreTitle").textContent = "本次 GP5 或在线编辑状态未能生成。";
       $("#noScoreText").textContent = "MIDI、和弦结果、分轨与 ZIP 仍可下载；请查看下方处理警告了解失败原因，或重新处理。";
@@ -464,11 +483,13 @@ function renderSummary(result) {
   const chordSummary = result.chord_summary || {};
   const uniqueChords = chordSummary.unique_chords || [];
   let chordText = "—";
-  if (result.chord_detection === false) chordText = "已关闭";
+  if (result.input_kind === "midi") chordText = "MIDI 输入跳过";
+  else if (result.chord_detection === false) chordText = "已关闭";
   else if (chordSegments.length) chordText = `${chordSegments.length} 段 · ${uniqueChords.length} 种`;
   else if (result.chord_detection) chordText = "未识别";
   const items = [
     ["状态", result.status === "partial" ? "部分成功" : "完成"],
+    ["输入", result.input_kind === "midi" ? "MIDI" : "音频"],
     ["输出", midiOnly ? "仅 MIDI" : "GP5 + MIDI"],
     ["拍号", meterInfo(result).signature],
     ["速度", result.bpm ? `${Number(result.bpm).toFixed(2)} BPM` : "—"],
@@ -517,7 +538,9 @@ function renderDownloads(result) {
   add(files.gp5, "多轨 Guitar Pro", "gp5");
   add(files.zip, "全部结果", "zip");
   add(files.full_midi, "多轨 MIDI", "mid");
+  add(files.reference_midi, "原始转录参考", "mid");
   add(files.chords, "和弦分析", "json");
+  add(files.flags, "人工检查标记", "json");
   for (const [stem, url] of Object.entries(files.midi || {})) {
     add(url, `${STEM_LABELS[stem] || stem} MIDI`, "mid");
   }
@@ -633,19 +656,38 @@ function renderMixer() {
     return;
   }
   for (const track of ui.scoreState.tracks || []) {
+    const soloed = ui.solo.has(track.id);
     const chip = document.createElement("span");
-    chip.className = `track-chip${track.muted ? " muted" : ""}`;
+    chip.className = `track-chip${track.muted ? " muted" : ""}${soloed ? " soloed" : ""}`;
     const name = document.createElement("strong");
     name.textContent = track.name || "Track";
     const count = track.is_percussion ? (track.drum_notes || []).length : (track.notes || []).length;
     const meta = document.createElement("span");
     meta.className = "track-meta";
     meta.textContent = `${count} 个音符`;
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = track.muted ? "取消静音" : "静音";
-    button.addEventListener("click", () => toggleMute(track, button));
-    chip.append(name, meta, button);
+    const mute = document.createElement("button");
+    mute.type = "button";
+    mute.textContent = track.muted ? "取消静音" : "静音";
+    mute.addEventListener("click", () => toggleMute(track, mute));
+    const solo = document.createElement("button");
+    solo.type = "button";
+    solo.textContent = soloed ? "取消 solo" : "solo";
+    solo.title = "只影响当前页面试听，不写入 tracks.json 或导出文件。";
+    solo.addEventListener("click", () => toggleSolo(track));
+    chip.append(name, meta, mute, solo);
+    if (!track.is_percussion && track.name !== "Vocals" && (track.tuning || []).length) {
+      const group = document.createElement("span");
+      group.className = "transpose-group";
+      for (const semitones of [-12, -1, 1, 12]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = semitones > 0 ? `+${semitones}` : String(semitones);
+        button.title = `整轨移调 ${semitones} 半音；重新指法，可撤销一步。`;
+        button.addEventListener("click", () => transposeTrack(track, semitones));
+        group.appendChild(button);
+      }
+      chip.appendChild(group);
+    }
     box.appendChild(chip);
   }
 }
@@ -653,11 +695,14 @@ function renderMixer() {
 function applyAlphaTabMutes() {
   if (!ui.at || !ui.at.score || !ui.scoreState) return;
   const tracks = ui.at.score.tracks || [];
+  const soloing = ui.solo.size > 0;
   for (let index = 0; index < tracks.length; index += 1) {
     const stateTrack = (ui.scoreState.tracks || [])[index];
     if (!stateTrack) continue;
+    // Solo is preview-only and overrides the persisted mute while active.
+    const muted = soloing ? !ui.solo.has(stateTrack.id) : Boolean(stateTrack.muted);
     try {
-      ui.at.changeTrackMute([tracks[index]], Boolean(stateTrack.muted));
+      ui.at.changeTrackMute([tracks[index]], muted);
     } catch { /* the player may not be ready yet */ }
   }
 }
@@ -879,6 +924,11 @@ function renderNoteEditor() {
     select.appendChild(option);
   }
   $("#manualFret").value = String(note.fret);
+  const flag = (ui.flags || []).find(
+    (item) => item.track_id === track.id && item.note_id === note.id
+  );
+  $("#flagNote").checked = Boolean(flag);
+  $("#flagReason").value = flag ? flag.reason || "" : "";
   $("#noteStatus").textContent = "";
   $("#noteStatus").classList.remove("error");
 }
@@ -920,7 +970,7 @@ async function patchPosition(payload, sourceButton) {
 async function deleteSelectedNote() {
   if (!ui.selected || !ui.scoreState || !ui.jobId) return;
   const { track, note } = ui.selected;
-  if (!window.confirm(`删除 ${track.name} 中 ${noteName(note.pitch)} 这个音符？此操作没有撤销按钮。`)) return;
+  if (!window.confirm(`删除 ${track.name} 中 ${noteName(note.pitch)} 这个音符？可用“撤销上一处修改”恢复一步。`)) return;
   const status = $("#noteStatus");
   status.textContent = "正在删除并重新生成 GP5…";
   status.classList.remove("error");
@@ -963,8 +1013,154 @@ async function toggleMute(track, button) {
   }
 }
 
+async function toggleSolo(track) {
+  if (!ui.scoreState) return;
+  if (ui.solo.has(track.id)) ui.solo.delete(track.id);
+  else ui.solo.add(track.id);
+  renderMixer();
+  applyAlphaTabMutes();
+  showToast(ui.solo.size
+    ? `试听 solo：${[...ui.solo].map((id) => {
+        const item = (ui.scoreState.tracks || []).find((candidate) => candidate.id === id);
+        return item ? item.name : id;
+      }).join(" / ")}（不改变导出文件）`
+    : "已退出 solo，恢复各轨静音状态。");
+}
+
+async function transposeTrack(track, semitones) {
+  if (!ui.scoreState || !ui.jobId) return;
+  const direction = semitones > 0 ? `+${semitones}` : String(semitones);
+  if (!window.confirm(
+    `把“${track.name}”整轨移调 ${direction} 半音？会重新搜索指法；超出最大品位的音将被删除，可用撤销恢复一步。`
+  )) return;
+  $("#scoreHint").textContent = `正在把 ${track.name} 移调 ${direction} 半音并重新生成 GP5…`;
+  try {
+    const response = await fetch(
+      `/api/jobs/${encodeURIComponent(ui.jobId)}/tracks/${encodeURIComponent(track.id)}/transpose`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ revision: Number(ui.scoreState.revision), semitones }),
+      },
+    );
+    const data = await readJson(response);
+    const dropped = Number(data.dropped || 0);
+    const message = dropped
+      ? `${track.name} 已移调 ${direction} 半音；${dropped} 个音超出可弹范围被删除，可撤销一步。`
+      : `${track.name} 已移调 ${direction} 半音。`;
+    handleEditResponse(data, message, true);
+  } catch (error) {
+    showToast(`移调失败：${error.message}`, true);
+    $("#scoreHint").textContent = "移调未完成，谱面保持原样。";
+    renderMixer();
+  }
+}
+
+async function undoLastEdit() {
+  if (!ui.scoreState || !ui.jobId) return;
+  const button = $("#undoBtn");
+  button.disabled = true;
+  $("#scoreHint").textContent = "正在撤销最近一步修改并重新生成 GP5…";
+  try {
+    const response = await fetch(`/api/jobs/${encodeURIComponent(ui.jobId)}/undo`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ revision: Number(ui.scoreState.revision) }),
+    });
+    const data = await readJson(response);
+    handleEditResponse(data, "已撤销最近一步修改。", true);
+  } catch (error) {
+    showToast(`撤销失败：${error.message}`, true);
+    $("#scoreHint").textContent = "撤销未完成，谱面保持原样。";
+    renderUndo(true);
+  }
+}
+
+function renderUndo(canUndo) {
+  const button = $("#undoBtn");
+  if (!button) return;
+  button.disabled = !canUndo;
+  button.title = canUndo
+    ? "恢复最近一次修改前的乐谱；只能撤销一步，撤销后这一步不能用“重做”恢复。"
+    : "没有可撤销的修改。";
+}
+
+function renderFlags() {
+  const panel = $("#flagPanel");
+  const list = $("#flagList");
+  if (!panel || !list) return;
+  list.textContent = "";
+  const flags = ui.flags || [];
+  $("#flagMeta").textContent = flags.length ? `${flags.length} 个标记` : "";
+  panel.hidden = flags.length === 0;
+  for (const flag of flags) {
+    const li = document.createElement("li");
+    const name = document.createElement("strong");
+    name.textContent = `${flag.track_name || flag.track_id} · ${noteName(flag.pitch)}`;
+    const position = document.createElement("span");
+    position.textContent = `第 ${flag.bar} 小节`;
+    const reason = document.createElement("span");
+    reason.className = "flag-reason";
+    reason.textContent = flag.reason || "";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "取消标记";
+    button.addEventListener("click", () => {
+      sendFlag(flag.track_id, flag.note_id, false, "", button);
+    });
+    li.append(name, position, reason, button);
+    list.appendChild(li);
+  }
+}
+
+async function sendFlag(trackId, noteId, flagged, reason, sourceButton) {
+  if (!ui.jobId || !ui.scoreState) return;
+  if (sourceButton) sourceButton.disabled = true;
+  try {
+    const response = await fetch(
+      `/api/jobs/${encodeURIComponent(ui.jobId)}/tracks/${encodeURIComponent(trackId)}/notes/${encodeURIComponent(noteId)}/flag`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ flagged, reason }),
+      },
+    );
+    const data = await readJson(response);
+    ui.flags = data.flags || [];
+    if (data.job && data.job.result) {
+      ui.result = data.job.result;
+      renderDownloads(ui.result);
+    }
+    renderFlags();
+    const status = $("#noteStatus");
+    if (ui.selected) renderNoteEditor();
+    if (status) {
+      status.textContent = flagged ? "已保存人工检查标记。" : "已取消该音符的标记。";
+      status.classList.remove("error");
+    }
+    if (data.warning) showToast(data.warning, true);
+  } catch (error) {
+    showToast(`标记保存失败：${error.message}`, true);
+    if (sourceButton) sourceButton.disabled = false;
+  }
+}
+
+function saveSelectedFlag() {
+  if (!ui.selected) return;
+  const { track, note } = ui.selected;
+  sendFlag(
+    track.id,
+    note.id,
+    $("#flagNote").checked,
+    $("#flagReason").value,
+    $("#applyFlagBtn"),
+  );
+}
+
 function handleEditResponse(data, message, reloadScore) {
   if (data.state) ui.scoreState = data.state;
+  if (Array.isArray(data.flags)) ui.flags = data.flags;
+  if (typeof data.can_undo === "boolean") renderUndo(data.can_undo);
   if (data.job) {
     ui.job = data.job;
     ui.result = data.job.result;
@@ -974,6 +1170,7 @@ function handleEditResponse(data, message, reloadScore) {
     renderStemPlayers(ui.result);
   }
   renderMixer();
+  renderFlags();
   renderDownloads(ui.result);
   closeNoteEditor();
   if (reloadScore) {
@@ -991,7 +1188,7 @@ function setupFileInput() {
   const update = () => {
     const file = input.files[0];
     if (!file) {
-      hint.textContent = "点击选择，或把文件拖到这里。请使用包含全部乐器的成品混音，而不是单独乐器轨。";
+      hint.textContent = "点击选择，或把文件拖到这里。音频请使用包含全部乐器的成品混音；也可以直接上传 .mid/.midi 跳过分离与转录。";
       drop.classList.remove("has-file");
       return;
     }
@@ -1037,6 +1234,8 @@ function bindEvents() {
     patchPosition({ string, fret });
   });
   $("#deleteNoteBtn").addEventListener("click", deleteSelectedNote);
+  $("#applyFlagBtn").addEventListener("click", saveSelectedFlag);
+  $("#undoBtn").addEventListener("click", undoLastEdit);
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !$("#noteEditor").hidden) closeNoteEditor();
   });
